@@ -6,17 +6,17 @@ BranchFS is a FUSE-based filesystem that enables speculative branching on top of
 
 | Feature | Description |
 |---------|-------------|
-| Snapshot Isolation | Branches capture their inherited parent view at creation time |
+| Lazy or Snapshot Isolation | Branches default to lazy inherited views for O(1) creation; legacy eager snapshots are available with `branchfs create --snapshot` |
 | Commit to Parent | Changes merge into immediate parent branch (or base if parent is main) |
 | Atomic Abort | Instantly discards leaf branch, parent and siblings unaffected |
 | Atomic Commit | Merges leaf branch into parent atomically |
 | mmap Invalidation | Memory-mapped files trigger SIGBUS after commit/abort |
-| @branch Virtual Paths | Access any branch directly via `/@branch-name/` without switching |
+| @branch Virtual Paths | Access any branch directly via `/@branch-name/` without switching; hide these with `branchfs mount --agent` for untrusted agent mounts |
 | Portable | Works on any underlying filesystem (ext4, xfs, nfs, etc.) |
 
 ## Architecture
 
-BranchFS is a FUSE-based filesystem that requires no root privileges. It implements file-level copy-on-write over a frozen inherited view: when a branch is created, BranchFS snapshots the parent's visible tree into the branch's inherited storage. When a file is modified on a branch, the file is copied to the branch's delta storage, and lookups prefer branch deltas/tombstones over the inherited snapshot. Deletions are tracked via tombstone markers. On commit, changes from a leaf branch are merged into its immediate parent (or applied to the base directory if the parent is main); on abort, the leaf branch's delta storage and inherited snapshot are discarded.
+BranchFS is a FUSE-based filesystem that requires no root privileges for ordinary FUSE mounts. It implements file-level copy-on-write over an inherited parent view. By default, new branches use lazy inheritance: branch creation writes metadata and empty delta/tombstone stores without walking the inherited tree, and lookups resolve `branch delta > branch tombstone > parent/base` at access time. Legacy eager snapshot inheritance remains available with `branchfs create --snapshot`. When a file is modified on a branch, the file is copied to the branch's delta storage. Deletions are tracked via tombstone markers. On commit, changes from a leaf branch are merged into its immediate parent (or applied to the base directory if the parent is main); on abort, the leaf branch's delta storage is discarded.
 
 ### Why not overlayfs?
 
@@ -109,9 +109,51 @@ branchfs commit /mnt/workspace
 # Or abort to discard (switches back to main, stays mounted)
 branchfs abort /mnt/workspace
 
-# Unmount when done (cleans up all branches, daemon exits when last mount removed)
+# Unmount when done (branch storage persists; daemon exits when last mount removed)
 branchfs unmount /mnt/workspace
 ```
+
+### CCC / Agent-Safe Lazy Branch Mode
+
+For large CCC-style writable mounts, create branches lazily and mount the selected branch directly. Lazy is the default for new branches; use `--snapshot` only when you explicitly want the legacy eager inherited-tree copy.
+
+```bash
+# Trusted launcher/reviewer side: mount with controls visible and create a lazy branch.
+branchfs mount \
+  --base /__real/storage_user \
+  --storage /__branchfs_store/storage_user \
+  /__branchfs_admin/storage_user
+branchfs create \
+  train-run-123 \
+  /__branchfs_admin/storage_user \
+  --storage /__branchfs_store/storage_user
+
+# Agent side: expose the selected branch at mount root and hide .branchfs_ctl/@branch.
+branchfs mount \
+  --base /__real/storage_user \
+  --storage /__branchfs_store/storage_user \
+  --branch train-run-123 \
+  --agent \
+  /__branchfs_mounts/storage_user
+
+# Trusted review/commit flow.
+branchfs freeze train-run-123 --storage /__branchfs_store/storage_user
+branchfs status train-run-123 --storage /__branchfs_store/storage_user
+branchfs commit-branch train-run-123 --storage /__branchfs_store/storage_user
+# or: branchfs abort-branch train-run-123 --storage /__branchfs_store/storage_user
+```
+
+Useful commands for this mode:
+
+- `branchfs mount --branch <name>` exposes a selected branch as the mount root.
+- `branchfs mount --agent` or `--no-control` hides `.branchfs_ctl` and `@branch` paths from an untrusted mount.
+- `branchfs status <name> --json` reports branch deltas and tombstones without scanning the base tree.
+- `branchfs freeze <name>` makes a branch read-only for stable review; `branchfs thaw <name>` reopens it.
+- `branchfs commit-branch <name>` and `branchfs abort-branch <name>` are trusted-control operations that do not require exposing `.branchfs_ctl` inside the agent mount.
+
+Relaxed multi-writer usage is intended for distributed jobs where nodes write different files in the same branch, e.g. per-host/per-rank logs and checkpoint shards. Concurrent writes/deletes/renames of the same path are not guaranteed.
+
+`--agent` is a security boundary helper: it hides the mounted control file and virtual branch namespace from the agent-visible tree. The trusted review/commit container must still keep real underlays and the BranchFS store/control channel out of the untrusted agent container.
 
 ### Nested Branches
 
@@ -194,7 +236,7 @@ cat /mnt/workspace/@agent-b/solution.py  # still works
 
 ### Shared Branch Namespace
 
-All mounts share a single branch namespace managed by the daemon. Branches created through any mount are visible from all mounts via `@branch` virtual paths. This simplifies multi-agent workflows — each agent accesses its branch via `/@branch-name/` without needing separate mount points.
+All control-enabled mounts share a single branch namespace managed by the daemon. Branches created through any such mount are visible via `@branch` virtual paths. Mounts started with `--agent`/`--no-control` hide these control paths from the mounted tree. This simplifies multi-agent workflows — each agent accesses its branch via `/@branch-name/` without needing separate mount points.
 
 ### Commit
 
