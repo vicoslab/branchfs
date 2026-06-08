@@ -17,7 +17,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Mount the filesystem (always starts on main branch)
+    /// Mount the filesystem
     Mount {
         /// Base directory to branch from (required on first mount)
         #[arg(long)]
@@ -26,6 +26,18 @@ enum Commands {
         /// Storage directory for branch data
         #[arg(long, default_value = "/var/lib/branchfs")]
         storage: PathBuf,
+
+        /// Branch to expose at the mount root
+        #[arg(long, default_value = "main")]
+        branch: String,
+
+        /// Hide .branchfs_ctl and @branch virtual directories from this mount
+        #[arg(long)]
+        no_control: bool,
+
+        /// Agent-safe alias for --no-control
+        #[arg(long)]
+        agent: bool,
 
         /// Enable FUSE passthrough for near-native I/O performance (requires root)
         #[arg(long)]
@@ -51,6 +63,10 @@ enum Commands {
         #[arg(long, short, default_value = "main")]
         parent: String,
 
+        /// Use legacy eager snapshot inheritance instead of O(1) lazy inheritance
+        #[arg(long)]
+        snapshot: bool,
+
         /// Storage directory
         #[arg(long, default_value = "/var/lib/branchfs")]
         storage: PathBuf,
@@ -74,6 +90,60 @@ enum Commands {
         /// Storage directory
         #[arg(long, default_value = "/var/lib/branchfs")]
         storage: PathBuf,
+    },
+
+    /// Commit a named branch through the daemon (trusted-control path)
+    CommitBranch {
+        /// Branch name to commit
+        branch: String,
+
+        /// Storage directory
+        #[arg(long, default_value = "/var/lib/branchfs")]
+        storage: PathBuf,
+    },
+
+    /// Abort a named branch through the daemon (trusted-control path)
+    AbortBranch {
+        /// Branch name to abort
+        branch: String,
+
+        /// Storage directory
+        #[arg(long, default_value = "/var/lib/branchfs")]
+        storage: PathBuf,
+    },
+
+    /// Freeze a branch read-only for stable review/commit
+    Freeze {
+        /// Branch name
+        branch: String,
+
+        /// Storage directory
+        #[arg(long, default_value = "/var/lib/branchfs")]
+        storage: PathBuf,
+    },
+
+    /// Thaw a frozen branch, allowing writes again
+    Thaw {
+        /// Branch name
+        branch: String,
+
+        /// Storage directory
+        #[arg(long, default_value = "/var/lib/branchfs")]
+        storage: PathBuf,
+    },
+
+    /// Show branch status/diff entries
+    Status {
+        /// Branch name
+        branch: String,
+
+        /// Storage directory
+        #[arg(long, default_value = "/var/lib/branchfs")]
+        storage: PathBuf,
+
+        /// Emit raw JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// List branches
@@ -161,6 +231,9 @@ fn main() -> Result<()> {
         Commands::Mount {
             base,
             storage,
+            branch,
+            no_control,
+            agent,
             passthrough,
             max_storage,
             mountpoint,
@@ -184,18 +257,23 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&mountpoint)?;
             let mountpoint = mountpoint.canonicalize()?;
 
-            // Send mount request (always mounts main branch)
+            // Send mount request for the selected branch.
+            let control = !(no_control || agent);
             let response = send_request(
                 &storage,
                 &Request::Mount {
-                    branch: "main".to_string(),
+                    branch: branch.clone(),
                     mountpoint: mountpoint.to_string_lossy().to_string(),
                     passthrough,
+                    control,
                 },
             )?;
 
             if response.ok {
-                println!("Mounted at {:?}", mountpoint);
+                println!(
+                    "Mounted branch '{}' at {:?} (control={})",
+                    branch, mountpoint, control
+                );
             } else {
                 eprintln!("Error: {}", response.error.unwrap_or_default());
                 process::exit(1);
@@ -206,6 +284,7 @@ fn main() -> Result<()> {
             name,
             mountpoint,
             parent,
+            snapshot,
             storage,
         } => {
             let storage = storage.canonicalize()?;
@@ -216,6 +295,7 @@ fn main() -> Result<()> {
                 &Request::Create {
                     name: name.clone(),
                     parent: parent.clone(),
+                    lazy: !snapshot,
                 },
             )?;
 
@@ -239,8 +319,10 @@ fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("Failed to switch to branch: {}", e))?;
 
                 println!(
-                    "Created and switched to branch '{}' (parent: '{}')",
-                    name, parent
+                    "Created and switched to branch '{}' (parent: '{}', inheritance: '{}')",
+                    name,
+                    parent,
+                    if snapshot { "snapshot" } else { "lazy" }
                 );
             } else {
                 eprintln!("Error: {}", response.error.unwrap_or_default());
@@ -310,21 +392,148 @@ fn main() -> Result<()> {
             let response = send_request(&storage, &Request::List)?;
 
             if response.ok {
-                println!("{:<20} {:<20}", "BRANCH", "PARENT");
-                println!("{:<20} {:<20}", "------", "------");
+                println!(
+                    "{:<20} {:<20} {:<10} {:<10} {:>8} {:>8}",
+                    "BRANCH", "PARENT", "STATE", "MODE", "DELTAS", "DELETES"
+                );
+                println!(
+                    "{:<20} {:<20} {:<10} {:<10} {:>8} {:>8}",
+                    "------", "------", "-----", "----", "------", "-------"
+                );
 
                 if let Some(data) = response.data {
                     if let Some(branches) = data.as_array() {
                         for branch in branches {
                             let name = branch["name"].as_str().unwrap_or("-");
                             let parent = branch["parent"].as_str().unwrap_or("-");
-                            println!("{:<20} {:<20}", name, parent);
+                            let state = branch["state"].as_str().unwrap_or("-");
+                            let mode = branch["inheritance"].as_str().unwrap_or("-");
+                            let deltas = branch["delta_entries"].as_u64().unwrap_or(0);
+                            let deletes = branch["tombstones"].as_u64().unwrap_or(0);
+                            println!(
+                                "{:<20} {:<20} {:<10} {:<10} {:>8} {:>8}",
+                                name, parent, state, mode, deltas, deletes
+                            );
                         }
                     }
                 }
             } else {
                 eprintln!("Error: {}", response.error.unwrap_or_default());
                 process::exit(1);
+            }
+        }
+
+        Commands::CommitBranch { branch, storage } => {
+            let storage = storage.canonicalize()?;
+            let response = send_request(
+                &storage,
+                &Request::CommitBranch {
+                    branch: branch.clone(),
+                },
+            )?;
+            if response.ok {
+                println!("Committed branch '{}'", branch);
+            } else {
+                eprintln!("Error: {}", response.error.unwrap_or_default());
+                process::exit(1);
+            }
+        }
+
+        Commands::AbortBranch { branch, storage } => {
+            let storage = storage.canonicalize()?;
+            let response = send_request(
+                &storage,
+                &Request::AbortBranch {
+                    branch: branch.clone(),
+                },
+            )?;
+            if response.ok {
+                println!("Aborted branch '{}'", branch);
+            } else {
+                eprintln!("Error: {}", response.error.unwrap_or_default());
+                process::exit(1);
+            }
+        }
+
+        Commands::Freeze { branch, storage } => {
+            let storage = storage.canonicalize()?;
+            let response = send_request(
+                &storage,
+                &Request::Freeze {
+                    branch: branch.clone(),
+                },
+            )?;
+            if response.ok {
+                println!("Frozen branch '{}'", branch);
+            } else {
+                eprintln!("Error: {}", response.error.unwrap_or_default());
+                process::exit(1);
+            }
+        }
+
+        Commands::Thaw { branch, storage } => {
+            let storage = storage.canonicalize()?;
+            let response = send_request(
+                &storage,
+                &Request::Thaw {
+                    branch: branch.clone(),
+                },
+            )?;
+            if response.ok {
+                println!("Thawed branch '{}'", branch);
+            } else {
+                eprintln!("Error: {}", response.error.unwrap_or_default());
+                process::exit(1);
+            }
+        }
+
+        Commands::Status {
+            branch,
+            storage,
+            json,
+        } => {
+            let storage = storage.canonicalize()?;
+            let response = send_request(
+                &storage,
+                &Request::Status {
+                    branch: branch.clone(),
+                },
+            )?;
+            if !response.ok {
+                eprintln!("Error: {}", response.error.unwrap_or_default());
+                process::exit(1);
+            }
+            let Some(data) = response.data else {
+                anyhow::bail!("daemon returned no status data");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&data)?);
+            } else {
+                println!("Branch:      {}", data["name"].as_str().unwrap_or("-"));
+                println!("Parent:      {}", data["parent"].as_str().unwrap_or("-"));
+                println!("State:       {}", data["state"].as_str().unwrap_or("-"));
+                println!(
+                    "Inheritance: {}",
+                    data["inheritance"].as_str().unwrap_or("-")
+                );
+                println!(
+                    "Deltas:      {}",
+                    data["delta_entries"].as_u64().unwrap_or(0)
+                );
+                println!("Deletes:     {}", data["tombstones"].as_u64().unwrap_or(0));
+                println!();
+                println!("{:<8} {:<10} {:>10} PATH", "OP", "KIND", "BYTES");
+                if let Some(diff) = data["diff"].as_array() {
+                    for entry in diff {
+                        println!(
+                            "{:<8} {:<10} {:>10} {}",
+                            entry["op"].as_str().unwrap_or("-"),
+                            entry["kind"].as_str().unwrap_or("-"),
+                            entry["bytes"].as_u64().unwrap_or(0),
+                            entry["path"].as_str().unwrap_or("-")
+                        );
+                    }
+                }
             }
         }
 
