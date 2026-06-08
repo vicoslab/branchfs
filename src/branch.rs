@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use fuser::Notifier;
 use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{BranchError, Result};
 use crate::inode::ROOT_INO;
@@ -220,12 +221,76 @@ fn commit_side_path(target: &Path, tag: &str) -> PathBuf {
     target.with_file_name(name)
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InheritanceMode {
+    /// Resolve inherited paths recursively from the parent/base at lookup time.
+    /// Branch creation is O(1) and does not scan or copy the inherited tree.
+    Lazy,
+    /// Preserve the legacy behavior: recursively snapshot the visible parent
+    /// tree into this branch's inherited directory at branch creation time.
+    Snapshot,
+}
+
+impl Default for InheritanceMode {
+    fn default() -> Self {
+        Self::Lazy
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchState {
+    Open,
+    Frozen,
+}
+
+impl Default for BranchState {
+    fn default() -> Self {
+        Self::Open
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BranchMetadata {
+    name: String,
+    parent: Option<String>,
+    inheritance: InheritanceMode,
+    state: BranchState,
+    parent_version_at_fork: u64,
+    commit_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffEntry {
+    pub op: String,
+    pub path: String,
+    pub kind: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchStatus {
+    pub name: String,
+    pub parent: Option<String>,
+    pub inheritance: InheritanceMode,
+    pub state: BranchState,
+    pub parent_version_at_fork: u64,
+    pub commit_count: u64,
+    pub delta_entries: usize,
+    pub tombstones: usize,
+    pub diff: Vec<DiffEntry>,
+}
+
 pub struct Branch {
     pub name: String,
     pub parent: Option<String>,
     pub files_dir: PathBuf,
     pub inherited_dir: PathBuf,
     pub tombstones_file: PathBuf,
+    meta_file: PathBuf,
+    pub inheritance: InheritanceMode,
+    state: RwLock<BranchState>,
     tombstones: RwLock<HashSet<String>>,
     /// Number of stale (removed-from-memory-but-still-on-disk) tombstone entries.
     /// When this exceeds the live set size, we compact the file.
@@ -242,11 +307,13 @@ impl Branch {
         parent: Option<&str>,
         storage_path: &Path,
         parent_version_at_fork: u64,
+        inheritance: InheritanceMode,
     ) -> Result<Self> {
         let branch_dir = storage_path.join("branches").join(name);
         let files_dir = branch_dir.join("files");
         let inherited_dir = branch_dir.join("inherited");
         let tombstones_file = branch_dir.join("tombstones");
+        let meta_file = branch_dir.join("meta.json");
 
         fs::create_dir_all(&files_dir)?;
         fs::create_dir_all(&inherited_dir)?;
@@ -256,17 +323,87 @@ impl Branch {
 
         let tombstones = Self::load_tombstones(&tombstones_file)?;
 
-        Ok(Self {
+        let branch = Self {
             name: name.to_string(),
             parent: parent.map(|s| s.to_string()),
             files_dir,
             inherited_dir,
             tombstones_file,
+            meta_file,
+            inheritance,
+            state: RwLock::new(BranchState::Open),
             tombstones: RwLock::new(tombstones),
             tombstone_stale: AtomicU64::new(0),
             commit_count: AtomicU64::new(0),
             parent_version_at_fork,
+        };
+        branch.write_metadata()?;
+        Ok(branch)
+    }
+
+    pub fn load(storage_path: &Path, name: &str) -> Result<Self> {
+        let branch_dir = storage_path.join("branches").join(name);
+        let files_dir = branch_dir.join("files");
+        let inherited_dir = branch_dir.join("inherited");
+        let tombstones_file = branch_dir.join("tombstones");
+        let meta_file = branch_dir.join("meta.json");
+
+        let meta_data = fs::read_to_string(&meta_file)?;
+        let metadata: BranchMetadata = serde_json::from_str(&meta_data)?;
+
+        fs::create_dir_all(&files_dir)?;
+        fs::create_dir_all(&inherited_dir)?;
+        if !tombstones_file.exists() {
+            File::create(&tombstones_file)?;
+        }
+        let tombstones = Self::load_tombstones(&tombstones_file)?;
+
+        Ok(Self {
+            name: metadata.name,
+            parent: metadata.parent,
+            files_dir,
+            inherited_dir,
+            tombstones_file,
+            meta_file,
+            inheritance: metadata.inheritance,
+            state: RwLock::new(metadata.state),
+            tombstones: RwLock::new(tombstones),
+            tombstone_stale: AtomicU64::new(0),
+            commit_count: AtomicU64::new(metadata.commit_count),
+            parent_version_at_fork: metadata.parent_version_at_fork,
         })
+    }
+
+    pub fn write_metadata(&self) -> Result<()> {
+        let metadata = BranchMetadata {
+            name: self.name.clone(),
+            parent: self.parent.clone(),
+            inheritance: self.inheritance,
+            state: *self.state.read(),
+            parent_version_at_fork: self.parent_version_at_fork,
+            commit_count: self.commit_count.load(Ordering::SeqCst),
+        };
+        let data = serde_json::to_vec_pretty(&metadata)?;
+        storage::ensure_parent_dirs(&self.meta_file)?;
+        let tmp = self
+            .meta_file
+            .with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
+        fs::write(&tmp, data)?;
+        fs::rename(&tmp, &self.meta_file)?;
+        Ok(())
+    }
+
+    pub fn state(&self) -> BranchState {
+        *self.state.read()
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.state() == BranchState::Open
+    }
+
+    pub fn set_state(&self, state: BranchState) -> Result<()> {
+        *self.state.write() = state;
+        self.write_metadata()
     }
 
     fn load_tombstones(path: &Path) -> Result<HashSet<String>> {
@@ -281,7 +418,26 @@ impl Branch {
     }
 
     pub fn is_deleted(&self, path: &str) -> bool {
-        self.tombstones.read().contains(path)
+        let tombstones = self.tombstones.read();
+        if tombstones.contains(path) {
+            return true;
+        }
+
+        // A tombstoned directory hides inherited descendants too. This keeps
+        // lazy lookup from falling through to parent/base children after an
+        // inherited directory is removed in this branch.
+        path.trim_start_matches('/')
+            .split('/')
+            .scan(String::new(), |prefix, part| {
+                if part.is_empty() {
+                    None
+                } else {
+                    prefix.push('/');
+                    prefix.push_str(part);
+                    Some(prefix.clone())
+                }
+            })
+            .any(|ancestor| tombstones.contains(&ancestor))
     }
 
     pub fn add_tombstone(&self, path: &str) -> Result<()> {
@@ -401,10 +557,33 @@ impl BranchManager {
 
         let quota = StorageQuota::scan_usage(&storage_path, max_storage);
 
-        // Always start fresh with just the "main" branch
+        // Load any branches already represented on disk. This keeps branch
+        // metadata/deltas durable across daemon restarts and is a step toward a
+        // shared-store/NFS model. Legacy branch directories without meta.json are
+        // ignored rather than deleted.
         let mut branches = HashMap::new();
-        let main_branch = Branch::new("main", None, &storage_path, 0)?;
-        branches.insert("main".to_string(), main_branch);
+        let branches_dir = storage_path.join("branches");
+        if let Ok(entries) = fs::read_dir(&branches_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if entry.path().join("meta.json").exists() {
+                    match Branch::load(&storage_path, &name) {
+                        Ok(branch) => {
+                            branches.insert(name, branch);
+                        }
+                        Err(e) => log::warn!("failed to load branch '{}': {}", name, e),
+                    }
+                }
+            }
+        }
+
+        if !branches.contains_key("main") {
+            let main_branch = Branch::new("main", None, &storage_path, 0, InheritanceMode::Lazy)?;
+            branches.insert("main".to_string(), main_branch);
+        }
 
         Ok(Self {
             storage_path,
@@ -464,6 +643,15 @@ impl BranchManager {
     }
 
     pub fn create_branch(&self, name: &str, parent: &str) -> Result<()> {
+        self.create_branch_with_mode(name, parent, InheritanceMode::Lazy)
+    }
+
+    pub fn create_branch_with_mode(
+        &self,
+        name: &str,
+        parent: &str,
+        inheritance: InheritanceMode,
+    ) -> Result<()> {
         let start = Instant::now();
         validate_branch_name(name)?;
 
@@ -478,17 +666,28 @@ impl BranchManager {
             .ok_or_else(|| BranchError::ParentNotFound(parent.to_string()))?;
         let parent_version = parent_branch.commit_count.load(Ordering::SeqCst);
 
-        let branch = Branch::new(name, Some(parent), &self.storage_path, parent_version)?;
-        if let Err(e) = self.snapshot_visible_tree(&branches, parent, &branch.inherited_dir) {
-            let _ = fs::remove_dir_all(self.storage_path.join("branches").join(name));
-            return Err(e);
+        let branch = Branch::new(
+            name,
+            Some(parent),
+            &self.storage_path,
+            parent_version,
+            inheritance,
+        )?;
+        if inheritance == InheritanceMode::Snapshot {
+            if let Err(e) = self.snapshot_visible_tree(&branches, parent, &branch.inherited_dir) {
+                let _ = fs::remove_dir_all(self.storage_path.join("branches").join(name));
+                return Err(e);
+            }
+            branch.write_metadata()?;
         }
         branches.insert(name.to_string(), branch);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
 
         let elapsed = start.elapsed();
         log::debug!(
-            "[BENCH] create_branch '{}': {:?} ({} us)",
+            "[BENCH] create_branch '{}' ({:?}): {:?} ({} us)",
             name,
+            inheritance,
             elapsed,
             elapsed.as_micros()
         );
@@ -645,11 +844,59 @@ impl BranchManager {
         }
     }
 
-    fn inherited_source_path(&self, branch: &Branch, rel_path: &str) -> PathBuf {
-        if branch.parent.is_some() {
-            branch.inherited_path(rel_path)
-        } else {
-            self.base_path.join(rel_path.trim_start_matches('/'))
+    fn read_dir_names(path: &Path) -> HashSet<String> {
+        let mut names = HashSet::new();
+        if let Ok(dir) = fs::read_dir(path) {
+            for entry in dir.flatten() {
+                names.insert(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+        names
+    }
+
+    fn inherited_dir_names_locked(
+        &self,
+        branches: &HashMap<String, Branch>,
+        branch: &Branch,
+        rel_path: &str,
+    ) -> Result<HashSet<String>> {
+        match branch.parent.as_deref() {
+            None => Ok(Self::read_dir_names(
+                &self.base_path.join(rel_path.trim_start_matches('/')),
+            )),
+            Some(parent) if branch.inheritance == InheritanceMode::Lazy => {
+                self.collect_dir_names_locked(branches, parent, rel_path)
+            }
+            Some(_) => Ok(Self::read_dir_names(&branch.inherited_path(rel_path))),
+        }
+    }
+
+    fn inherited_resolve_path_locked(
+        &self,
+        branches: &HashMap<String, Branch>,
+        branch: &Branch,
+        rel_path: &str,
+    ) -> Result<Option<PathBuf>> {
+        match branch.parent.as_deref() {
+            None => {
+                let inherited = self.base_path.join(rel_path.trim_start_matches('/'));
+                if inherited.symlink_metadata().is_ok() {
+                    Ok(Some(inherited))
+                } else {
+                    Ok(None)
+                }
+            }
+            Some(parent) if branch.inheritance == InheritanceMode::Lazy => {
+                self.resolve_path_locked(branches, parent, rel_path)
+            }
+            Some(_) => {
+                let inherited = branch.inherited_path(rel_path);
+                if inherited.symlink_metadata().is_ok() {
+                    Ok(Some(inherited))
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 
@@ -665,18 +912,8 @@ impl BranchManager {
         let mut names = HashSet::new();
 
         let delta_dir = branch.files_dir.join(rel_path.trim_start_matches('/'));
-        if let Ok(dir) = fs::read_dir(&delta_dir) {
-            for entry in dir.flatten() {
-                names.insert(entry.file_name().to_string_lossy().to_string());
-            }
-        }
-
-        let inherited_dir = self.inherited_source_path(branch, rel_path);
-        if let Ok(dir) = fs::read_dir(&inherited_dir) {
-            for entry in dir.flatten() {
-                names.insert(entry.file_name().to_string_lossy().to_string());
-            }
-        }
+        names.extend(Self::read_dir_names(&delta_dir));
+        names.extend(self.inherited_dir_names_locked(branches, branch, rel_path)?);
 
         Ok(names)
     }
@@ -691,20 +928,15 @@ impl BranchManager {
             .get(branch_name)
             .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
-        if branch.is_deleted(rel_path) {
-            return Ok(None);
-        }
-
         if branch.has_delta(rel_path) {
             return Ok(Some(branch.delta_path(rel_path)));
         }
 
-        let inherited = self.inherited_source_path(branch, rel_path);
-        if inherited.symlink_metadata().is_ok() {
-            Ok(Some(inherited))
-        } else {
-            Ok(None)
+        if branch.is_deleted(rel_path) {
+            return Ok(None);
         }
+
+        self.inherited_resolve_path_locked(branches, branch, rel_path)
     }
 
     fn snapshot_visible_tree(
@@ -770,6 +1002,113 @@ impl BranchManager {
     pub fn resolve_path(&self, branch_name: &str, rel_path: &str) -> Result<Option<PathBuf>> {
         let branches = self.branches.read();
         self.resolve_path_locked(&branches, branch_name, rel_path)
+    }
+
+    pub fn is_branch_writable(&self, branch_name: &str) -> bool {
+        self.branches
+            .read()
+            .get(branch_name)
+            .map(|b| b.is_writable())
+            .unwrap_or(false)
+    }
+
+    pub fn freeze_branch(&self, branch_name: &str) -> Result<()> {
+        if branch_name == "main" {
+            return Err(BranchError::CannotOperateOnMain);
+        }
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+        branch.set_state(BranchState::Frozen)?;
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        drop(branches);
+        self.invalidate_branches(&[branch_name.to_string()]);
+        Ok(())
+    }
+
+    pub fn thaw_branch(&self, branch_name: &str) -> Result<()> {
+        if branch_name == "main" {
+            return Err(BranchError::CannotOperateOnMain);
+        }
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+        branch.set_state(BranchState::Open)?;
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        drop(branches);
+        self.invalidate_branches(&[branch_name.to_string()]);
+        Ok(())
+    }
+
+    fn collect_delta_diff(dir: &Path, prefix: &str, out: &mut Vec<DiffEntry>) -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel_path = if prefix.is_empty() {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", prefix, name)
+            };
+            let meta = path.symlink_metadata()?;
+            let kind = if meta.file_type().is_symlink() {
+                "symlink"
+            } else if meta.file_type().is_dir() {
+                "dir"
+            } else {
+                "file"
+            };
+            out.push(DiffEntry {
+                op: "delta".to_string(),
+                path: rel_path.clone(),
+                kind: kind.to_string(),
+                bytes: if meta.file_type().is_file() {
+                    meta.len()
+                } else {
+                    0
+                },
+            });
+            if meta.file_type().is_dir() {
+                Self::collect_delta_diff(&path, &rel_path, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn branch_status(&self, branch_name: &str) -> Result<BranchStatus> {
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+
+        let mut diff = Vec::new();
+        Self::collect_delta_diff(&branch.files_dir, "", &mut diff)?;
+        for tombstone in branch.get_tombstones() {
+            diff.push(DiffEntry {
+                op: "delete".to_string(),
+                path: tombstone,
+                kind: "tombstone".to_string(),
+                bytes: 0,
+            });
+        }
+        diff.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.op.cmp(&b.op)));
+
+        Ok(BranchStatus {
+            name: branch.name.clone(),
+            parent: branch.parent.clone(),
+            inheritance: branch.inheritance,
+            state: branch.state(),
+            parent_version_at_fork: branch.parent_version_at_fork,
+            commit_count: branch.commit_count.load(Ordering::SeqCst),
+            delta_entries: diff.iter().filter(|e| e.op == "delta").count(),
+            tombstones: diff.iter().filter(|e| e.op == "delete").count(),
+            diff,
+        })
     }
 
     /// Returns true if no other branch has `parent == name`.
@@ -857,6 +1196,7 @@ impl BranchManager {
             // Increment parent's commit_count (first-wins bookkeeping)
             if let Some(main_branch) = branches.get("main") {
                 main_branch.commit_count.fetch_add(1, Ordering::SeqCst);
+                main_branch.write_metadata()?;
             }
 
             // Remove branch
@@ -921,6 +1261,7 @@ impl BranchManager {
 
             // Increment parent's commit_count (first-wins bookkeeping)
             parent.commit_count.fetch_add(1, Ordering::SeqCst);
+            parent.write_metadata()?;
 
             // Remove child branch
             branches.remove(branch_name);
@@ -1023,6 +1364,175 @@ impl BranchManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod branch_manager_tests {
+    use super::{BranchManager, BranchState, InheritanceMode};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("branchfs-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&p).unwrap();
+            TmpDir(p)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write(path: &Path, data: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, data).unwrap();
+    }
+
+    fn manager(tmp: &TmpDir) -> BranchManager {
+        let base = tmp.path().join("base");
+        let storage = tmp.path().join("storage");
+        let work = tmp.path().join("work");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        BranchManager::new(storage, base, work, None).unwrap()
+    }
+
+    #[test]
+    fn lazy_branch_resolves_base_without_inherited_snapshot_and_prefers_delta() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        let base_file = tmp.path().join("base/dir/base.txt");
+        write(&base_file, b"base");
+
+        mgr.create_branch_with_mode("lazy", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        mgr.with_branch("lazy", |branch| {
+            assert!(!branch.inherited_path("/dir/base.txt").exists());
+            Ok(())
+        })
+        .unwrap();
+
+        let resolved = mgr.resolve_path("lazy", "/dir/base.txt").unwrap().unwrap();
+        assert_eq!(resolved, base_file);
+        assert_eq!(fs::read(&resolved).unwrap(), b"base");
+
+        mgr.with_branch("lazy", |branch| {
+            write(&branch.delta_path("/dir/base.txt"), b"delta");
+            branch.add_tombstone("/dir/base.txt")?;
+            Ok(())
+        })
+        .unwrap();
+
+        let resolved = mgr.resolve_path("lazy", "/dir/base.txt").unwrap().unwrap();
+        assert_eq!(fs::read(&resolved).unwrap(), b"delta");
+    }
+
+    #[test]
+    fn lazy_directory_tombstone_hides_inherited_descendants_but_not_delta_children() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/dir/base.txt"), b"base");
+
+        mgr.create_branch_with_mode("lazy", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.with_branch("lazy", |branch| {
+            branch.add_tombstone("/dir")?;
+            write(&branch.delta_path("/dir/new.txt"), b"new");
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(mgr.resolve_path("lazy", "/dir/base.txt").unwrap().is_none());
+
+        let resolved = mgr.resolve_path("lazy", "/dir/new.txt").unwrap().unwrap();
+        assert_eq!(fs::read(&resolved).unwrap(), b"new");
+    }
+
+    #[test]
+    fn freeze_and_thaw_state_persist_across_manager_reloads() {
+        let tmp = TmpDir::new();
+        {
+            let mgr = manager(&tmp);
+            mgr.create_branch_with_mode("review", "main", InheritanceMode::Lazy)
+                .unwrap();
+            mgr.freeze_branch("review").unwrap();
+            assert_eq!(
+                mgr.branch_status("review").unwrap().state,
+                BranchState::Frozen
+            );
+            assert!(!mgr.is_branch_writable("review"));
+        }
+
+        {
+            let mgr = manager(&tmp);
+            assert_eq!(
+                mgr.branch_status("review").unwrap().state,
+                BranchState::Frozen
+            );
+            assert!(!mgr.is_branch_writable("review"));
+            mgr.thaw_branch("review").unwrap();
+            assert_eq!(
+                mgr.branch_status("review").unwrap().state,
+                BranchState::Open
+            );
+            assert!(mgr.is_branch_writable("review"));
+        }
+
+        let mgr = manager(&tmp);
+        assert_eq!(
+            mgr.branch_status("review").unwrap().state,
+            BranchState::Open
+        );
+        assert!(mgr.is_branch_writable("review"));
+    }
+
+    #[test]
+    fn branch_status_reports_only_delta_and_tombstone_changes() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/unchanged.txt"), b"unchanged");
+        write(&tmp.path().join("base/deleted.txt"), b"deleted");
+
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.with_branch("work", |branch| {
+            write(&branch.delta_path("/new.txt"), b"new");
+            write(&branch.delta_path("/nested/file.txt"), b"nested");
+            branch.add_tombstone("/deleted.txt")?;
+            Ok(())
+        })
+        .unwrap();
+
+        let status = mgr.branch_status("work").unwrap();
+        let entries: Vec<_> = status
+            .diff
+            .iter()
+            .map(|entry| (entry.op.as_str(), entry.kind.as_str(), entry.path.as_str()))
+            .collect();
+
+        assert_eq!(status.delta_entries, 3);
+        assert_eq!(status.tombstones, 1);
+        assert!(entries.contains(&("delta", "file", "/new.txt")));
+        assert!(entries.contains(&("delta", "dir", "/nested")));
+        assert!(entries.contains(&("delta", "file", "/nested/file.txt")));
+        assert!(entries.contains(&("delete", "tombstone", "/deleted.txt")));
+        assert!(!status
+            .diff
+            .iter()
+            .any(|entry| entry.path == "/unchanged.txt"));
     }
 }
 
