@@ -51,13 +51,29 @@ enum Commands {
         mountpoint: PathBuf,
     },
 
-    /// Create a new branch and switch to it
+    /// Start the storage daemon without mounting (trusted-control path)
+    StartDaemon {
+        /// Base directory to branch from (required on first start)
+        #[arg(long)]
+        base: Option<PathBuf>,
+
+        /// Storage directory for branch data
+        #[arg(long, default_value = "/var/lib/branchfs")]
+        storage: PathBuf,
+
+        /// Maximum storage size for all branch deltas (e.g. "500M", "2G", bytes)
+        #[arg(long, value_parser = parse_size)]
+        max_storage: Option<u64>,
+    },
+
+    /// Create a new branch (and switch a mountpoint to it, if given)
     Create {
         /// Branch name
         name: String,
 
-        /// Mount point to switch to the new branch
-        mountpoint: PathBuf,
+        /// Mount point to switch to the new branch (omit to only create:
+        /// supervisors mount the branch later with `mount --branch`)
+        mountpoint: Option<PathBuf>,
 
         /// Parent branch name
         #[arg(long, short, default_value = "main")]
@@ -280,6 +296,24 @@ fn main() -> Result<()> {
             }
         }
 
+        Commands::StartDaemon {
+            base,
+            storage,
+            max_storage,
+        } => {
+            std::fs::create_dir_all(&storage)?;
+            let storage = storage.canonicalize()?;
+            let base = base.map(|b| b.canonicalize()).transpose()?;
+
+            daemon::ensure_daemon(base.as_deref(), &storage, max_storage)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            println!(
+                "Daemon ready at {:?}",
+                get_socket_path(&storage)
+            );
+        }
+
         Commands::Create {
             name,
             mountpoint,
@@ -288,7 +322,7 @@ fn main() -> Result<()> {
             storage,
         } => {
             let storage = storage.canonicalize()?;
-            let mountpoint = mountpoint.canonicalize()?;
+            let mountpoint = mountpoint.map(|m| m.canonicalize()).transpose()?;
 
             let response = send_request(
                 &storage,
@@ -300,30 +334,39 @@ fn main() -> Result<()> {
             )?;
 
             if response.ok {
-                // Switch to the new branch via ctl file
-                // (FUSE handler updates manager.mount_branches internally)
-                let ctl_path = mountpoint.join(".branchfs_ctl");
+                if let Some(mountpoint) = mountpoint {
+                    // Switch to the new branch via ctl file
+                    // (FUSE handler updates manager.mount_branches internally)
+                    let ctl_path = mountpoint.join(".branchfs_ctl");
 
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&ctl_path)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to open control file (is {} mounted?): {}",
-                            mountpoint.display(),
-                            e
-                        )
-                    })?;
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&ctl_path)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to open control file (is {} mounted?): {}",
+                                mountpoint.display(),
+                                e
+                            )
+                        })?;
 
-                file.write_all(format!("switch:{}", name).as_bytes())
-                    .map_err(|e| anyhow::anyhow!("Failed to switch to branch: {}", e))?;
+                    file.write_all(format!("switch:{}", name).as_bytes())
+                        .map_err(|e| anyhow::anyhow!("Failed to switch to branch: {}", e))?;
 
-                println!(
-                    "Created and switched to branch '{}' (parent: '{}', inheritance: '{}')",
-                    name,
-                    parent,
-                    if snapshot { "snapshot" } else { "lazy" }
-                );
+                    println!(
+                        "Created and switched to branch '{}' (parent: '{}', inheritance: '{}')",
+                        name,
+                        parent,
+                        if snapshot { "snapshot" } else { "lazy" }
+                    );
+                } else {
+                    println!(
+                        "Created branch '{}' (parent: '{}', inheritance: '{}')",
+                        name,
+                        parent,
+                        if snapshot { "snapshot" } else { "lazy" }
+                    );
+                }
             } else {
                 eprintln!("Error: {}", response.error.unwrap_or_default());
                 process::exit(1);
