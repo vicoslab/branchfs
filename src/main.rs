@@ -83,6 +83,11 @@ enum Commands {
         #[arg(long)]
         snapshot: bool,
 
+        /// Hide an inherited path from this branch's view (repeatable;
+        /// relative to the branch root, e.g. --hide .ssh --hide .env)
+        #[arg(long = "hide")]
+        hide: Vec<String>,
+
         /// Storage directory
         #[arg(long, default_value = "/var/lib/branchfs")]
         storage: PathBuf,
@@ -308,10 +313,7 @@ fn main() -> Result<()> {
             daemon::ensure_daemon(base.as_deref(), &storage, max_storage)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            println!(
-                "Daemon ready at {:?}",
-                get_socket_path(&storage)
-            );
+            println!("Daemon ready at {:?}", get_socket_path(&storage));
         }
 
         Commands::Create {
@@ -319,6 +321,7 @@ fn main() -> Result<()> {
             mountpoint,
             parent,
             snapshot,
+            hide,
             storage,
         } => {
             let storage = storage.canonicalize()?;
@@ -330,6 +333,7 @@ fn main() -> Result<()> {
                     name: name.clone(),
                     parent: parent.clone(),
                     lazy: !snapshot,
+                    hide,
                 },
             )?;
 

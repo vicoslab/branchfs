@@ -259,6 +259,20 @@ struct BranchMetadata {
     state: BranchState,
     parent_version_at_fork: u64,
     commit_count: u64,
+    /// Inherited paths masked from this branch's view (agent-safe secret
+    /// hiding). Stored as normalized `/`-prefixed relative paths.
+    #[serde(default)]
+    hide_paths: Vec<String>,
+}
+
+/// Normalize a hide path to a `/`-prefixed, no-trailing-slash relative path.
+/// Returns None for entries that would be empty or hide the entire root.
+fn normalize_hide_path(path: &str) -> Option<String> {
+    let trimmed = path.trim().trim_start_matches('/').trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("/{}", trimmed))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -299,6 +313,10 @@ pub struct Branch {
     pub commit_count: AtomicU64,
     /// Parent's commit_count at the time this branch was forked.
     pub parent_version_at_fork: u64,
+    /// Inherited paths masked from this branch's view. The branch's own
+    /// deltas always stay visible; hiding only blocks parent/base
+    /// fallthrough, so hidden underlay data can never be read or COWed.
+    pub hide_paths: Vec<String>,
 }
 
 impl Branch {
@@ -308,6 +326,7 @@ impl Branch {
         storage_path: &Path,
         parent_version_at_fork: u64,
         inheritance: InheritanceMode,
+        hide_paths: Vec<String>,
     ) -> Result<Self> {
         let branch_dir = storage_path.join("branches").join(name);
         let files_dir = branch_dir.join("files");
@@ -336,6 +355,10 @@ impl Branch {
             tombstone_stale: AtomicU64::new(0),
             commit_count: AtomicU64::new(0),
             parent_version_at_fork,
+            hide_paths: hide_paths
+                .iter()
+                .filter_map(|p| normalize_hide_path(p))
+                .collect(),
         };
         branch.write_metadata()?;
         Ok(branch)
@@ -371,6 +394,7 @@ impl Branch {
             tombstone_stale: AtomicU64::new(0),
             commit_count: AtomicU64::new(metadata.commit_count),
             parent_version_at_fork: metadata.parent_version_at_fork,
+            hide_paths: metadata.hide_paths,
         })
     }
 
@@ -382,6 +406,7 @@ impl Branch {
             state: *self.state.read(),
             parent_version_at_fork: self.parent_version_at_fork,
             commit_count: self.commit_count.load(Ordering::SeqCst),
+            hide_paths: self.hide_paths.clone(),
         };
         let data = serde_json::to_vec_pretty(&metadata)?;
         storage::ensure_parent_dirs(&self.meta_file)?;
@@ -391,6 +416,21 @@ impl Branch {
         fs::write(&tmp, data)?;
         fs::rename(&tmp, &self.meta_file)?;
         Ok(())
+    }
+
+    /// True if `rel_path` (or an ancestor of it) is masked by a hide rule.
+    /// Hiding only affects inherited resolution: the branch's own deltas
+    /// remain visible even at hidden paths.
+    pub fn is_hidden(&self, rel_path: &str) -> bool {
+        if self.hide_paths.is_empty() {
+            return false;
+        }
+        let Some(path) = normalize_hide_path(rel_path) else {
+            return false;
+        };
+        self.hide_paths
+            .iter()
+            .any(|hidden| path == *hidden || path.starts_with(&format!("{}/", hidden)))
     }
 
     pub fn state(&self) -> BranchState {
@@ -581,7 +621,14 @@ impl BranchManager {
         }
 
         if !branches.contains_key("main") {
-            let main_branch = Branch::new("main", None, &storage_path, 0, InheritanceMode::Lazy)?;
+            let main_branch = Branch::new(
+                "main",
+                None,
+                &storage_path,
+                0,
+                InheritanceMode::Lazy,
+                Vec::new(),
+            )?;
             branches.insert("main".to_string(), main_branch);
         }
 
@@ -652,6 +699,16 @@ impl BranchManager {
         parent: &str,
         inheritance: InheritanceMode,
     ) -> Result<()> {
+        self.create_branch_with_options(name, parent, inheritance, Vec::new())
+    }
+
+    pub fn create_branch_with_options(
+        &self,
+        name: &str,
+        parent: &str,
+        inheritance: InheritanceMode,
+        hide_paths: Vec<String>,
+    ) -> Result<()> {
         let start = Instant::now();
         validate_branch_name(name)?;
 
@@ -672,6 +729,7 @@ impl BranchManager {
             &self.storage_path,
             parent_version,
             inheritance,
+            hide_paths,
         )?;
         if inheritance == InheritanceMode::Snapshot {
             if let Err(e) = self.snapshot_visible_tree(&branches, parent, &branch.inherited_dir) {
@@ -913,7 +971,17 @@ impl BranchManager {
 
         let delta_dir = branch.files_dir.join(rel_path.trim_start_matches('/'));
         names.extend(Self::read_dir_names(&delta_dir));
-        names.extend(self.inherited_dir_names_locked(branches, branch, rel_path)?);
+        for name in self.inherited_dir_names_locked(branches, branch, rel_path)? {
+            let child_rel = if rel_path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", rel_path.trim_end_matches('/'), name)
+            };
+            if branch.is_hidden(&child_rel) {
+                continue;
+            }
+            names.insert(name);
+        }
 
         Ok(names)
     }
@@ -933,6 +1001,12 @@ impl BranchManager {
         }
 
         if branch.is_deleted(rel_path) {
+            return Ok(None);
+        }
+
+        // Hide rules mask inherited data only: without a delta above, the
+        // path must not resolve through the parent/base chain.
+        if branch.is_hidden(rel_path) {
             return Ok(None);
         }
 
@@ -1533,6 +1607,86 @@ mod branch_manager_tests {
             .diff
             .iter()
             .any(|entry| entry.path == "/unchanged.txt"));
+    }
+
+    #[test]
+    fn hidden_paths_do_not_resolve_through_inheritance() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/.ssh/id_rsa"), b"SECRET");
+        write(&tmp.path().join("base/.env"), b"TOKEN=x");
+        write(&tmp.path().join("base/Projects/ok.py"), b"fine");
+
+        mgr.create_branch_with_options(
+            "agent",
+            "main",
+            InheritanceMode::Lazy,
+            vec![".ssh".into(), "/.env".into()],
+        )
+        .unwrap();
+
+        // hidden file and everything below a hidden dir are unresolvable
+        assert!(mgr.resolve_path("agent", "/.ssh").unwrap().is_none());
+        assert!(mgr.resolve_path("agent", "/.ssh/id_rsa").unwrap().is_none());
+        assert!(mgr.resolve_path("agent", "/.env").unwrap().is_none());
+        // non-hidden inherited paths still resolve
+        assert!(mgr
+            .resolve_path("agent", "/Projects/ok.py")
+            .unwrap()
+            .is_some());
+        // the same paths stay visible on main (per-branch masking)
+        assert!(mgr.resolve_path("main", "/.ssh/id_rsa").unwrap().is_some());
+    }
+
+    #[test]
+    fn hidden_paths_filtered_from_readdir_but_delta_shadow_visible() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/.env"), b"TOKEN=real");
+        write(&tmp.path().join("base/visible.txt"), b"data");
+
+        mgr.create_branch_with_options("agent", "main", InheritanceMode::Lazy, vec![".env".into()])
+            .unwrap();
+
+        let names = mgr.collect_dir_names("agent", "/").unwrap();
+        assert!(!names.contains(".env"), "hidden name listed: {:?}", names);
+        assert!(names.contains("visible.txt"));
+
+        // an agent-created delta at the hidden path shadows it: visible to
+        // the agent, but never exposing the real underlay content
+        write(
+            &tmp.path().join("storage/branches/agent/files/.env"),
+            b"TOKEN=agent-own",
+        );
+        let resolved = mgr.resolve_path("agent", "/.env").unwrap().unwrap();
+        assert_eq!(std::fs::read(&resolved).unwrap(), b"TOKEN=agent-own");
+        let names = mgr.collect_dir_names("agent", "/").unwrap();
+        assert!(names.contains(".env"));
+        // status reports the shadow as a delta so review policy can flag it
+        let status = mgr.branch_status("agent").unwrap();
+        assert!(status
+            .diff
+            .iter()
+            .any(|e| e.path == "/.env" && e.op == "delta"));
+    }
+
+    #[test]
+    fn hide_paths_survive_metadata_reload() {
+        let tmp = TmpDir::new();
+        write(&tmp.path().join("base/.netrc"), b"machine x login y");
+        {
+            let mgr = manager(&tmp);
+            mgr.create_branch_with_options(
+                "agent",
+                "main",
+                InheritanceMode::Lazy,
+                vec![".netrc".into()],
+            )
+            .unwrap();
+        }
+        let mgr = manager(&tmp); // fresh manager over same storage
+        assert!(mgr.resolve_path("agent", "/.netrc").unwrap().is_none());
+        assert!(mgr.resolve_path("main", "/.netrc").unwrap().is_some());
     }
 }
 

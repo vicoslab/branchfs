@@ -39,6 +39,9 @@ pub enum Request {
         parent: String,
         #[serde(default = "default_true")]
         lazy: bool,
+        /// Inherited paths to mask from this branch's view (secret hiding).
+        #[serde(default)]
+        hide: Vec<String>,
     },
     Freeze {
         branch: String,
@@ -245,13 +248,20 @@ impl Daemon {
         self.mounts.lock().len()
     }
 
-    pub fn create_branch(&self, name: &str, parent: &str, lazy: bool) -> Result<()> {
+    pub fn create_branch(
+        &self,
+        name: &str,
+        parent: &str,
+        lazy: bool,
+        hide: Vec<String>,
+    ) -> Result<()> {
         let mode = if lazy {
             InheritanceMode::Lazy
         } else {
             InheritanceMode::Snapshot
         };
-        self.manager.create_branch_with_mode(name, parent, mode)
+        self.manager
+            .create_branch_with_options(name, parent, mode, hide)
     }
 
     pub fn list_branches(&self) -> Vec<(String, Option<String>)> {
@@ -354,12 +364,15 @@ impl Daemon {
                     Err(e) => Response::error(&format!("{}", e)),
                 }
             }
-            Request::Create { name, parent, lazy } => {
-                match self.create_branch(&name, &parent, lazy) {
-                    Ok(()) => Response::success(),
-                    Err(e) => Response::error(&format!("{}", e)),
-                }
-            }
+            Request::Create {
+                name,
+                parent,
+                lazy,
+                hide,
+            } => match self.create_branch(&name, &parent, lazy, hide) {
+                Ok(()) => Response::success(),
+                Err(e) => Response::error(&format!("{}", e)),
+            },
             Request::Freeze { branch } => match self.manager.freeze_branch(&branch) {
                 Ok(()) => Response::success(),
                 Err(e) => Response::error(&format!("{}", e)),

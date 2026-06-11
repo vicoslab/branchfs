@@ -106,6 +106,7 @@ fn supervisor_flow_create_status_freeze_commit() {
         name: "agent-session-1".into(),
         parent: "main".into(),
         lazy: true,
+        hide: vec![],
     });
     assert!(resp.ok, "create failed: {:?}", resp.error);
 
@@ -183,6 +184,7 @@ fn supervisor_flow_abort_discards_branch() {
         name: "agent-session-2".into(),
         parent: "main".into(),
         lazy: true,
+        hide: vec![],
     });
     assert!(resp.ok);
 
@@ -208,6 +210,55 @@ fn supervisor_flow_abort_discards_branch() {
 }
 
 #[test]
+fn hidden_paths_mask_inherited_data_and_persist() {
+    let tmp = TmpDir::new();
+    let base = tmp.path().join("base");
+    let storage = tmp.path().join("storage");
+    write(&base.join(".ssh/id_rsa"), b"SECRET KEY");
+    write(&base.join(".env"), b"TOKEN=hunter2");
+    write(&base.join("Projects/code.py"), b"print('ok')");
+
+    let mut daemon = DaemonHandle::start(&base, &storage);
+
+    let resp = daemon.request(&Request::Create {
+        name: "agent-hidden".into(),
+        parent: "main".into(),
+        lazy: true,
+        hide: vec![".ssh".into(), "/.env".into()],
+    });
+    assert!(resp.ok, "create failed: {:?}", resp.error);
+    daemon.shutdown();
+
+    // Reload the store from scratch: hide rules must persist in branch
+    // metadata, and the manager (the resolver every FUSE op goes through)
+    // must refuse to resolve hidden inherited paths.
+    let mgr = Daemon::new(
+        base.to_path_buf(),
+        storage.to_path_buf(),
+        base.to_path_buf(),
+        None,
+    )
+    .unwrap()
+    .get_manager();
+    assert!(mgr
+        .resolve_path("agent-hidden", "/.ssh/id_rsa")
+        .unwrap()
+        .is_none());
+    assert!(mgr.resolve_path("agent-hidden", "/.env").unwrap().is_none());
+    assert!(mgr
+        .resolve_path("agent-hidden", "/Projects/code.py")
+        .unwrap()
+        .is_some());
+    // readdir must not list hidden names
+    let names = mgr.collect_dir_names("agent-hidden", "/").unwrap();
+    assert!(!names.contains(".ssh"));
+    assert!(!names.contains(".env"));
+    assert!(names.contains("Projects"));
+    // main branch is unaffected
+    assert!(mgr.resolve_path("main", "/.ssh/id_rsa").unwrap().is_some());
+}
+
+#[test]
 fn frozen_branch_survives_daemon_restart() {
     let tmp = TmpDir::new();
     let base = tmp.path().join("base");
@@ -220,6 +271,7 @@ fn frozen_branch_survives_daemon_restart() {
             name: "agent-session-3".into(),
             parent: "main".into(),
             lazy: true,
+            hide: vec![],
         });
         assert!(resp.ok);
         let resp = daemon.request(&Request::Freeze {
