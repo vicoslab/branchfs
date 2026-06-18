@@ -43,6 +43,12 @@ enum Commands {
         #[arg(long)]
         passthrough: bool,
 
+        /// Allow access from uids other than the mounting process (FUSE
+        /// allow_other).  Needed when a root daemon mounts a view that a
+        /// non-root agent must read/write (privilege-separated chroot model).
+        #[arg(long)]
+        allow_other: bool,
+
         /// Maximum storage size for all branch deltas (e.g. "500M", "2G", bytes)
         #[arg(long, value_parser = parse_size)]
         max_storage: Option<u64>,
@@ -256,6 +262,7 @@ fn main() -> Result<()> {
             no_control,
             agent,
             passthrough,
+            allow_other,
             max_storage,
             mountpoint,
         } => {
@@ -287,6 +294,7 @@ fn main() -> Result<()> {
                     mountpoint: mountpoint.to_string_lossy().to_string(),
                     passthrough,
                     control,
+                    allow_other,
                 },
             )?;
 

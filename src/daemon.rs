@@ -30,6 +30,8 @@ pub enum Request {
         passthrough: bool,
         #[serde(default = "default_true")]
         control: bool,
+        #[serde(default)]
+        allow_other: bool,
     },
     Unmount {
         mountpoint: String,
@@ -161,6 +163,7 @@ impl Daemon {
         mountpoint: &Path,
         passthrough: bool,
         control: bool,
+        allow_other: bool,
     ) -> Result<()> {
         if !self.manager.is_branch_valid(branch_name) {
             return Err(crate::error::BranchError::NotFound(branch_name.to_string()));
@@ -176,6 +179,12 @@ impl Daemon {
         );
         let mut options = vec![MountOption::FSName("branchfs".to_string())];
         options.extend(crate::platform::get_mount_options());
+        if allow_other {
+            // Lets a non-root agent uid access a view mounted by the root
+            // daemon (privilege-separated chroot model).  Root may set this
+            // without `user_allow_other` in /etc/fuse.conf.
+            options.push(MountOption::AllowOther);
+        }
 
         log::info!(
             "Spawning mount for branch '{}' at {:?} (control={})",
@@ -347,12 +356,13 @@ impl Daemon {
                 mountpoint,
                 passthrough,
                 control,
+                allow_other,
             } => {
                 let path = PathBuf::from(&mountpoint);
                 if let Err(e) = fs::create_dir_all(&path) {
                     return Response::error(&format!("Failed to create mountpoint: {}", e));
                 }
-                match self.spawn_mount(&branch, &path, passthrough, control) {
+                match self.spawn_mount(&branch, &path, passthrough, control, allow_other) {
                     Ok(()) => Response::success(),
                     Err(e) => Response::error(&format!("{}", e)),
                 }
