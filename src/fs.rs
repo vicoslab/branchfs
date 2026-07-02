@@ -1049,7 +1049,13 @@ impl Filesystem for BranchFs {
             } else {
                 format!("{}/{}", parent_rel, name_str)
             };
-            let delta = self.get_delta_path_for_branch(&branch, &rel_path);
+            let delta = match self.ensure_cow_for_branch(&branch, &rel_path) {
+                Ok(p) => p,
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
             if storage::ensure_parent_dirs(&delta).is_err() {
                 reply.error(libc::EIO);
                 return;
@@ -1087,7 +1093,13 @@ impl Filesystem for BranchFs {
                         reply.error(errno);
                         return;
                     }
-                    let delta = self.get_delta_path(&path);
+                    let delta = match self.ensure_cow(&path) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    };
                     if storage::ensure_parent_dirs(&delta).is_err() {
                         reply.error(libc::EIO);
                         return;
@@ -1329,7 +1341,13 @@ impl Filesystem for BranchFs {
             }
         };
 
-        let dst_delta = self.get_delta_path_for_branch(&branch, &dst_rel);
+        let dst_delta = match self.ensure_cow_for_branch(&branch, &dst_rel) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         if storage::ensure_parent_dirs(&dst_delta).is_err() {
             reply.error(libc::EIO);
             return;
@@ -1366,12 +1384,12 @@ impl Filesystem for BranchFs {
             if src_inherited {
                 b.add_tombstone(&src_rel)?;
             } else {
-                b.remove_tombstone(&src_rel);
+                b.remove_tombstone(&src_rel)?;
             }
             if dst_existed {
                 b.add_tombstone(&dst_rel)?;
             }
-            b.remove_tombstone(&dst_rel);
+            b.remove_tombstone(&dst_rel)?;
             Ok(())
         });
         if result.is_err() {
@@ -1810,7 +1828,13 @@ impl Filesystem for BranchFs {
             } else {
                 format!("{}/{}", parent_rel, name_str)
             };
-            let delta = self.get_delta_path_for_branch(&branch, &rel_path);
+            let delta = match self.ensure_cow_for_branch(&branch, &rel_path) {
+                Ok(p) => p,
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
             match std::fs::create_dir_all(&delta) {
                 Ok(_) => {
                     use std::os::unix::fs::PermissionsExt;
@@ -1843,7 +1867,13 @@ impl Filesystem for BranchFs {
                         reply.error(errno);
                         return;
                     }
-                    let delta = self.get_delta_path(&path);
+                    let delta = match self.ensure_cow(&path) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    };
                     match std::fs::create_dir_all(&delta) {
                         Ok(_) => {
                             use std::os::unix::fs::PermissionsExt;
@@ -1953,7 +1983,13 @@ impl Filesystem for BranchFs {
             } else {
                 format!("{}/{}", parent_rel, name_str)
             };
-            let delta = self.get_delta_path_for_branch(&branch, &rel_path);
+            let delta = match self.ensure_cow_for_branch(&branch, &rel_path) {
+                Ok(p) => p,
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
             if storage::ensure_parent_dirs(&delta).is_err() {
                 reply.error(libc::EIO);
                 return;
@@ -1985,7 +2021,13 @@ impl Filesystem for BranchFs {
                         reply.error(errno);
                         return;
                     }
-                    let delta = self.get_delta_path(&path);
+                    let delta = match self.ensure_cow(&path) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    };
                     if storage::ensure_parent_dirs(&delta).is_err() {
                         reply.error(libc::EIO);
                         return;

@@ -127,6 +127,10 @@ enum Commands {
         /// Storage directory
         #[arg(long, default_value = "/var/lib/branchfs")]
         storage: PathBuf,
+
+        /// Emit raw JSON commit outcome
+        #[arg(long)]
+        json: bool,
     },
 
     /// Abort a named branch through the daemon (trusted-control path)
@@ -478,7 +482,11 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::CommitBranch { branch, storage } => {
+        Commands::CommitBranch {
+            branch,
+            storage,
+            json,
+        } => {
             let storage = storage.canonicalize()?;
             let response = send_request(
                 &storage,
@@ -487,7 +495,35 @@ fn main() -> Result<()> {
                 },
             )?;
             if response.ok {
-                println!("Committed branch '{}'", branch);
+                if json {
+                    let data = response
+                        .data
+                        .ok_or_else(|| anyhow::anyhow!("daemon returned no commit outcome"))?;
+                    println!("{}", serde_json::to_string_pretty(&data)?);
+                } else {
+                    let conflicts = response
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("conflicts"))
+                        .and_then(|v| v.as_array())
+                        .map(|items| items.len())
+                        .unwrap_or(0);
+                    let auto_merges = response
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("auto_merges"))
+                        .and_then(|v| v.as_array())
+                        .map(|items| items.len())
+                        .unwrap_or(0);
+                    if conflicts > 0 || auto_merges > 0 {
+                        println!(
+                            "Committed branch '{}' ({} auto-merge(s), {} conflict(s); latest session won remaining conflicts)",
+                            branch, auto_merges, conflicts
+                        );
+                    } else {
+                        println!("Committed branch '{}'", branch);
+                    }
+                }
             } else {
                 eprintln!("Error: {}", response.error.unwrap_or_default());
                 process::exit(1);

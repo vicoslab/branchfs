@@ -5,7 +5,6 @@ use std::time::UNIX_EPOCH;
 use fuser::{FileAttr, FileType};
 
 use crate::fs::{BranchFs, BLOCK_SIZE};
-use crate::storage;
 
 impl BranchFs {
     pub(crate) fn resolve(&self, path: &str) -> Option<std::path::PathBuf> {
@@ -23,22 +22,6 @@ impl BranchFs {
         self.manager.resolve_path(branch, path).ok()?
     }
 
-    pub(crate) fn get_delta_path(&self, rel_path: &str) -> std::path::PathBuf {
-        self.manager
-            .with_branch(&self.get_branch_name(), |b| Ok(b.delta_path(rel_path)))
-            .unwrap()
-    }
-
-    pub(crate) fn get_delta_path_for_branch(
-        &self,
-        branch: &str,
-        rel_path: &str,
-    ) -> std::path::PathBuf {
-        self.manager
-            .with_branch(branch, |b| Ok(b.delta_path(rel_path)))
-            .unwrap()
-    }
-
     pub(crate) fn ensure_cow(&self, rel_path: &str) -> std::io::Result<std::path::PathBuf> {
         self.ensure_cow_for_branch(&self.get_branch_name(), rel_path)
     }
@@ -48,32 +31,9 @@ impl BranchFs {
         branch: &str,
         rel_path: &str,
     ) -> std::io::Result<std::path::PathBuf> {
-        if !self.branch_writable(branch) {
-            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
-        }
-
-        let delta = self.get_delta_path_for_branch(branch, rel_path);
-
-        if delta.symlink_metadata().is_err() {
-            if let Some(src) = self.resolve_for_branch(branch, rel_path) {
-                if let Ok(meta) = src.symlink_metadata() {
-                    if meta.file_type().is_symlink() || meta.file_type().is_file() {
-                        let src_size = meta.len();
-                        self.manager
-                            .quota
-                            .check(src_size)
-                            .map_err(std::io::Error::from_raw_os_error)?;
-                        storage::copy_entry(&src, &delta)
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-                        self.manager.quota.add(src_size);
-                    }
-                }
-            }
-        }
-
-        storage::ensure_parent_dirs(&delta).map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        Ok(delta)
+        self.manager
+            .ensure_delta_path_for_write(branch, rel_path)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     pub(crate) fn make_attr(&self, ino: u64, path: &Path) -> Option<FileAttr> {

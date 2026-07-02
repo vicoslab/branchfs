@@ -398,8 +398,11 @@ impl Daemon {
                 },
                 Err(e) => Response::error(&format!("{}", e)),
             },
-            Request::CommitBranch { branch } => match self.manager.commit(&branch) {
-                Ok(parent) => Response::success_with_data(serde_json::json!({ "parent": parent })),
+            Request::CommitBranch { branch } => match self.manager.commit_with_report(&branch) {
+                Ok(outcome) => match serde_json::to_value(outcome) {
+                    Ok(value) => Response::success_with_data(value),
+                    Err(e) => Response::error(&format!("{}", e)),
+                },
                 Err(e) => Response::error(&format!("{}", e)),
             },
             Request::AbortBranch { branch } => match self.manager.abort(&branch) {
