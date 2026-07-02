@@ -1148,16 +1148,7 @@ impl Filesystem for BranchFs {
                 format!("{}/{}", parent_rel, name_str)
             };
 
-            let result = self.manager.with_branch(&branch, |b| {
-                b.add_tombstone(&rel_path)?;
-                let delta = b.delta_path(&rel_path);
-                if delta.exists() {
-                    let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-                    std::fs::remove_file(&delta)?;
-                    self.manager.quota.sub(freed);
-                }
-                Ok(())
-            });
+            let result = self.manager.delete_path_in_branch(&branch, &rel_path);
 
             if result.is_err() {
                 reply.error(libc::EIO);
@@ -1185,16 +1176,7 @@ impl Filesystem for BranchFs {
                         reply.error(errno);
                         return;
                     }
-                    let result = self.manager.with_branch(&current_branch, |b| {
-                        b.add_tombstone(&path)?;
-                        let delta = b.delta_path(&path);
-                        if delta.exists() {
-                            let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-                            std::fs::remove_file(&delta)?;
-                            self.manager.quota.sub(freed);
-                        }
-                        Ok(())
-                    });
+                    let result = self.manager.delete_path_in_branch(&current_branch, &path);
 
                     if result.is_err() || self.is_stale() {
                         reply.error(libc::ESTALE);
@@ -1314,6 +1296,10 @@ impl Filesystem for BranchFs {
             reply.error(libc::ENOENT);
             return;
         }
+        let src_inherited = self
+            .manager
+            .inherited_path_exists(&branch, &src_rel)
+            .unwrap_or(false);
 
         // RENAME_NOREPLACE
         if crate::platform::check_rename_noreplace(flags)
@@ -1360,9 +1346,17 @@ impl Filesystem for BranchFs {
             return;
         }
 
-        // Update tombstones: mark src deleted, revive dst, tombstone old dst
+        // Update tombstones: only hide the old source if it also existed in
+        // the inherited view. Branch-local temps (e.g. bash history rename
+        // scratch files) should disappear completely, not become delete
+        // tombstones in review status. Revive the destination because its delta
+        // now provides the visible entry.
         let result = self.manager.with_branch(&branch, |b| {
-            b.add_tombstone(&src_rel)?;
+            if src_inherited {
+                b.add_tombstone(&src_rel)?;
+            } else {
+                b.remove_tombstone(&src_rel);
+            }
             if dst_existed {
                 b.add_tombstone(&dst_rel)?;
             }

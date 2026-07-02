@@ -1078,6 +1078,74 @@ impl BranchManager {
         self.resolve_path_locked(&branches, branch_name, rel_path)
     }
 
+    fn inherited_path_exists_locked(
+        &self,
+        branches: &HashMap<String, Branch>,
+        branch: &Branch,
+        rel_path: &str,
+    ) -> Result<bool> {
+        if branch.is_hidden(rel_path) {
+            return Ok(false);
+        }
+        Ok(self
+            .inherited_resolve_path_locked(branches, branch, rel_path)?
+            .is_some())
+    }
+
+    pub fn inherited_path_exists(&self, branch_name: &str, rel_path: &str) -> Result<bool> {
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+        self.inherited_path_exists_locked(&branches, branch, rel_path)
+    }
+
+    fn prune_empty_delta_parents(files_dir: &Path, start: Option<&Path>) {
+        let Some(start) = start else {
+            return;
+        };
+        let mut current = start.to_path_buf();
+        while current.starts_with(files_dir) && current != files_dir {
+            match fs::remove_dir(&current) {
+                Ok(()) => {
+                    if let Some(parent) = current.parent() {
+                        current = parent.to_path_buf();
+                    } else {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    pub fn delete_path_in_branch(&self, branch_name: &str, rel_path: &str) -> Result<()> {
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+
+        let inherited_exists = self.inherited_path_exists_locked(&branches, branch, rel_path)?;
+        let delta = branch.delta_path(rel_path);
+        if let Ok(meta) = delta.symlink_metadata() {
+            let freed = if meta.file_type().is_dir() {
+                StorageQuota::dir_size(&delta)
+            } else {
+                meta.len()
+            };
+            remove_entry(&delta)?;
+            self.quota.sub(freed);
+            Self::prune_empty_delta_parents(&branch.files_dir, delta.parent());
+        }
+
+        if inherited_exists {
+            branch.add_tombstone(rel_path)?;
+        } else {
+            branch.remove_tombstone(rel_path);
+        }
+        Ok(())
+    }
+
     pub fn is_branch_writable(&self, branch_name: &str) -> bool {
         self.branches
             .read()
@@ -1130,16 +1198,18 @@ impl BranchManager {
                 format!("{}/{}", prefix, name)
             };
             let meta = path.symlink_metadata()?;
+            if meta.file_type().is_dir() {
+                Self::collect_delta_diff(&path, &rel_path, out)?;
+                continue;
+            }
             let kind = if meta.file_type().is_symlink() {
                 "symlink"
-            } else if meta.file_type().is_dir() {
-                "dir"
             } else {
                 "file"
             };
             out.push(DiffEntry {
                 op: "delta".to_string(),
-                path: rel_path.clone(),
+                path: rel_path,
                 kind: kind.to_string(),
                 bytes: if meta.file_type().is_file() {
                     meta.len()
@@ -1147,9 +1217,6 @@ impl BranchManager {
                     0
                 },
             });
-            if meta.file_type().is_dir() {
-                Self::collect_delta_diff(&path, &rel_path, out)?;
-            }
         }
         Ok(())
     }
@@ -1597,16 +1664,72 @@ mod branch_manager_tests {
             .map(|entry| (entry.op.as_str(), entry.kind.as_str(), entry.path.as_str()))
             .collect();
 
-        assert_eq!(status.delta_entries, 3);
+        assert_eq!(status.delta_entries, 2);
         assert_eq!(status.tombstones, 1);
         assert!(entries.contains(&("delta", "file", "/new.txt")));
-        assert!(entries.contains(&("delta", "dir", "/nested")));
         assert!(entries.contains(&("delta", "file", "/nested/file.txt")));
         assert!(entries.contains(&("delete", "tombstone", "/deleted.txt")));
+        assert!(!entries.iter().any(|(_, kind, _)| *kind == "dir"));
         assert!(!status
             .diff
             .iter()
             .any(|entry| entry.path == "/unchanged.txt"));
+    }
+
+    #[test]
+    fn deleting_branch_local_temp_file_leaves_no_tombstone_or_empty_parent_delta() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.with_branch("work", |branch| {
+            write(
+                &branch.delta_path("/domen-cuda10/.bash_history-00002.tmp"),
+                b"transient history",
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        mgr.delete_path_in_branch("work", "/domen-cuda10/.bash_history-00002.tmp")
+            .unwrap();
+
+        let status = mgr.branch_status("work").unwrap();
+        assert!(status.diff.is_empty(), "unexpected diff: {:?}", status.diff);
+        mgr.with_branch("work", |branch| {
+            assert!(!branch
+                .delta_path("/domen-cuda10/.bash_history-00002.tmp")
+                .exists());
+            assert!(!branch.delta_path("/domen-cuda10").exists());
+            assert!(branch.get_tombstones().is_empty());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn deleting_modified_inherited_file_reports_only_delete_tombstone() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/existing.txt"), b"base");
+
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.with_branch("work", |branch| {
+            write(&branch.delta_path("/existing.txt"), b"modified");
+            Ok(())
+        })
+        .unwrap();
+
+        mgr.delete_path_in_branch("work", "/existing.txt").unwrap();
+
+        let status = mgr.branch_status("work").unwrap();
+        assert_eq!(status.delta_entries, 0);
+        assert_eq!(status.tombstones, 1);
+        assert_eq!(status.diff.len(), 1);
+        assert_eq!(status.diff[0].op, "delete");
+        assert_eq!(status.diff[0].path, "/existing.txt");
     }
 
     #[test]
