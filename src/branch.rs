@@ -91,7 +91,7 @@ impl StorageQuota {
 /// Returns `Ok(())` even if the path doesn't exist; propagates real I/O errors.
 fn remove_entry(path: &Path) -> std::io::Result<()> {
     match path.symlink_metadata() {
-        Ok(m) if m.file_type().is_dir() => fs::remove_dir_all(path),
+        Ok(m) if m.file_type().is_dir() => remove_branch_store_dir_all(path),
         Ok(_) => fs::remove_file(path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -1884,6 +1884,36 @@ mod branch_manager_tests {
                 .delta_path("/domen-cuda10/.bash_history-00002.tmp")
                 .exists());
             assert!(!branch.delta_path("/domen-cuda10").exists());
+            assert!(branch.get_tombstones().is_empty());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_branch_local_mode_000_dir_leaves_no_tombstone_or_delta() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        let _reset = mgr
+            .with_branch("work", |branch| {
+                let private = branch.delta_path("/scratch/private");
+                write(&private.join("inside.txt"), b"inside");
+                Ok(make_mode_000_dir(&private))
+            })
+            .unwrap();
+
+        mgr.delete_path_in_branch("work", "/scratch/private")
+            .unwrap();
+
+        let status = mgr.branch_status("work").unwrap();
+        assert!(status.diff.is_empty(), "unexpected diff: {:?}", status.diff);
+        mgr.with_branch("work", |branch| {
+            assert!(!branch.delta_path("/scratch/private").exists());
+            assert!(!branch.delta_path("/scratch").exists());
             assert!(branch.get_tombstones().is_empty());
             Ok(())
         })
