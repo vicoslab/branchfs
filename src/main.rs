@@ -589,6 +589,19 @@ fn main() -> Result<()> {
                         );
                     }
                 }
+                if let Some(warnings) = data["warnings"].as_array() {
+                    if !warnings.is_empty() {
+                        println!();
+                        println!("Warnings:");
+                        for warning in warnings {
+                            println!(
+                                "  {}: {}",
+                                warning["path"].as_str().unwrap_or("-"),
+                                warning["message"].as_str().unwrap_or("-")
+                            );
+                        }
+                    }
+                }
             }
         }
 

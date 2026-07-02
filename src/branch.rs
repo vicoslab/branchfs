@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -284,6 +284,12 @@ pub struct DiffEntry {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct StatusWarning {
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct BranchStatus {
     pub name: String,
     pub parent: Option<String>,
@@ -293,6 +299,7 @@ pub struct BranchStatus {
     pub commit_count: u64,
     pub delta_entries: usize,
     pub tombstones: usize,
+    pub warnings: Vec<StatusWarning>,
     pub diff: Vec<DiffEntry>,
 }
 
@@ -1116,12 +1123,59 @@ impl BranchManager {
         Ok(())
     }
 
-    fn collect_delta_diff(dir: &Path, prefix: &str, out: &mut Vec<DiffEntry>) -> Result<()> {
+    fn status_path(prefix: &str) -> String {
+        if prefix.is_empty() {
+            "/".to_string()
+        } else {
+            prefix.to_string()
+        }
+    }
+
+    fn status_warning(path: &str, message: String) -> StatusWarning {
+        StatusWarning {
+            path: Self::status_path(path),
+            message,
+        }
+    }
+
+    fn collect_delta_diff(
+        dir: &Path,
+        prefix: &str,
+        out: &mut Vec<DiffEntry>,
+        warnings: &mut Vec<StatusWarning>,
+    ) -> Result<()> {
         if !dir.exists() {
             return Ok(());
         }
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                warnings.push(Self::status_warning(
+                    prefix,
+                    format!(
+                        "unreadable delta directory: {}; descendants omitted from status and commit may fail until permissions are fixed or the entry is removed",
+                        err
+                    ),
+                ));
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                    warnings.push(Self::status_warning(
+                        prefix,
+                        format!(
+                            "unreadable delta directory entry: {}; status may be incomplete and commit may fail until permissions are fixed or the entry is removed",
+                            err
+                        ),
+                    ));
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             let rel_path = if prefix.is_empty() {
@@ -1129,7 +1183,20 @@ impl BranchManager {
             } else {
                 format!("{}/{}", prefix, name)
             };
-            let meta = path.symlink_metadata()?;
+            let meta = match path.symlink_metadata() {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                    warnings.push(Self::status_warning(
+                        &rel_path,
+                        format!(
+                            "unreadable delta entry metadata: {}; status may be incomplete and commit may fail until permissions are fixed or the entry is removed",
+                            err
+                        ),
+                    ));
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
             let kind = if meta.file_type().is_symlink() {
                 "symlink"
             } else if meta.file_type().is_dir() {
@@ -1147,8 +1214,23 @@ impl BranchManager {
                     0
                 },
             });
+            if meta.file_type().is_file() {
+                if let Err(err) = File::open(&path) {
+                    if err.kind() == ErrorKind::PermissionDenied {
+                        warnings.push(Self::status_warning(
+                            &rel_path,
+                            format!(
+                                "unreadable delta file: {}; status can report metadata but commit may fail until permissions are fixed or the entry is removed",
+                                err
+                            ),
+                        ));
+                    } else {
+                        return Err(err.into());
+                    }
+                }
+            }
             if meta.file_type().is_dir() {
-                Self::collect_delta_diff(&path, &rel_path, out)?;
+                Self::collect_delta_diff(&path, &rel_path, out, warnings)?;
             }
         }
         Ok(())
@@ -1161,7 +1243,8 @@ impl BranchManager {
             .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
         let mut diff = Vec::new();
-        Self::collect_delta_diff(&branch.files_dir, "", &mut diff)?;
+        let mut warnings = Vec::new();
+        Self::collect_delta_diff(&branch.files_dir, "", &mut diff, &mut warnings)?;
         for tombstone in branch.get_tombstones() {
             diff.push(DiffEntry {
                 op: "delete".to_string(),
@@ -1171,6 +1254,7 @@ impl BranchManager {
             });
         }
         diff.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.op.cmp(&b.op)));
+        warnings.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.message.cmp(&b.message)));
 
         Ok(BranchStatus {
             name: branch.name.clone(),
@@ -1181,6 +1265,7 @@ impl BranchManager {
             commit_count: branch.commit_count.load(Ordering::SeqCst),
             delta_entries: diff.iter().filter(|e| e.op == "delta").count(),
             tombstones: diff.iter().filter(|e| e.op == "delete").count(),
+            warnings,
             diff,
         })
     }
@@ -1474,6 +1559,35 @@ mod branch_manager_tests {
         fs::write(path, data).unwrap();
     }
 
+    #[cfg(unix)]
+    struct ModeGuard {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    #[cfg(unix)]
+    impl ModeGuard {
+        fn chmod(path: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let original = path.symlink_metadata().unwrap().permissions().mode();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            Self {
+                path: path.to_path_buf(),
+                mode: original,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+        }
+    }
+
     fn manager(tmp: &TmpDir) -> BranchManager {
         let base = tmp.path().join("base");
         let storage = tmp.path().join("storage");
@@ -1607,6 +1721,72 @@ mod branch_manager_tests {
             .diff
             .iter()
             .any(|entry| entry.path == "/unchanged.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_status_warns_and_skips_unreadable_delta_directory() {
+        if unsafe { libc::geteuid() == 0 } {
+            return;
+        }
+
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        let unreadable = tmp
+            .path()
+            .join("storage/branches/work/files/scratch/overlay/work/work");
+        fs::create_dir_all(&unreadable).unwrap();
+        write(&unreadable.join("hidden.txt"), b"hidden");
+        let _guard = ModeGuard::chmod(&unreadable, 0o000);
+
+        let status = mgr.branch_status("work").unwrap();
+        let entries: Vec<_> = status
+            .diff
+            .iter()
+            .map(|entry| (entry.op.as_str(), entry.kind.as_str(), entry.path.as_str()))
+            .collect();
+
+        assert!(entries.contains(&("delta", "dir", "/scratch/overlay/work/work")));
+        assert!(!entries
+            .iter()
+            .any(|(_, _, path)| *path == "/scratch/overlay/work/work/hidden.txt"));
+        assert_eq!(status.warnings.len(), 1);
+        assert_eq!(status.warnings[0].path, "/scratch/overlay/work/work");
+        assert!(status.warnings[0]
+            .message
+            .contains("unreadable delta directory"));
+        assert!(status.warnings[0].message.contains("commit may fail"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_status_warns_when_delta_file_cannot_be_read_for_commit() {
+        if unsafe { libc::geteuid() == 0 } {
+            return;
+        }
+
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        let unreadable = tmp.path().join("storage/branches/work/files/secret.bin");
+        write(&unreadable, b"secret");
+        let _guard = ModeGuard::chmod(&unreadable, 0o000);
+
+        let status = mgr.branch_status("work").unwrap();
+        let entries: Vec<_> = status
+            .diff
+            .iter()
+            .map(|entry| (entry.op.as_str(), entry.kind.as_str(), entry.path.as_str()))
+            .collect();
+
+        assert!(entries.contains(&("delta", "file", "/secret.bin")));
+        assert_eq!(status.warnings.len(), 1);
+        assert_eq!(status.warnings[0].path, "/secret.bin");
+        assert!(status.warnings[0].message.contains("unreadable delta file"));
+        assert!(status.warnings[0].message.contains("commit may fail"));
     }
 
     #[test]
