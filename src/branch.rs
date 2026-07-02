@@ -98,6 +98,86 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Temporarily add owner rwx bits to an internal branch-store directory so the
+/// supervisor can inspect it even if the agent-visible mode is 000. The original
+/// mode is restored when the guard is dropped.
+struct StoreDirModeGuard<'a> {
+    path: &'a Path,
+    original_mode: Option<u32>,
+}
+
+impl<'a> StoreDirModeGuard<'a> {
+    fn new(path: &'a Path) -> std::io::Result<Self> {
+        Ok(Self {
+            path,
+            original_mode: add_owner_rwx_if_dir(path)?,
+        })
+    }
+}
+
+impl Drop for StoreDirModeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(mode) = self.original_mode {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _ = fs::set_permissions(self.path, fs::Permissions::from_mode(mode));
+        }
+    }
+}
+
+fn add_owner_rwx_if_dir(path: &Path) -> std::io::Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = path.symlink_metadata()?;
+    if !meta.file_type().is_dir() {
+        return Ok(None);
+    }
+
+    let mode = meta.permissions().mode();
+    if mode & 0o700 == 0o700 {
+        return Ok(None);
+    }
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
+    Ok(Some(mode))
+}
+
+fn make_branch_store_tree_removable(path: &Path) -> std::io::Result<()> {
+    match path.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+
+    let _ = add_owner_rwx_if_dir(path)?;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        if child
+            .symlink_metadata()
+            .map(|meta| meta.file_type().is_dir())
+            .unwrap_or(false)
+        {
+            make_branch_store_tree_removable(&child)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_branch_store_dir_all(path: &Path) -> std::io::Result<()> {
+    match path.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_dir() => {
+            make_branch_store_tree_removable(path)?;
+            fs::remove_dir_all(path)
+        }
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// An in-progress merge that prepares all of its destructive work as
 /// rollback-able side files, then publishes it in one near-infallible phase.
 ///
@@ -733,7 +813,7 @@ impl BranchManager {
         )?;
         if inheritance == InheritanceMode::Snapshot {
             if let Err(e) = self.snapshot_visible_tree(&branches, parent, &branch.inherited_dir) {
-                let _ = fs::remove_dir_all(self.storage_path.join("branches").join(name));
+                let _ = remove_branch_store_dir_all(&self.storage_path.join("branches").join(name));
                 return Err(e);
             }
             branch.write_metadata()?;
@@ -1117,9 +1197,14 @@ impl BranchManager {
     }
 
     fn collect_delta_diff(dir: &Path, prefix: &str, out: &mut Vec<DiffEntry>) -> Result<()> {
-        if !dir.exists() {
-            return Ok(());
+        match dir.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
         }
+
+        let _guard = StoreDirModeGuard::new(dir)?;
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -1277,7 +1362,7 @@ impl BranchManager {
             branches.remove(branch_name);
             let branch_dir = self.storage_path.join("branches").join(branch_name);
             if branch_dir.exists() {
-                fs::remove_dir_all(&branch_dir)?;
+                remove_branch_store_dir_all(&branch_dir)?;
             }
 
             self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -1341,7 +1426,7 @@ impl BranchManager {
             branches.remove(branch_name);
             let branch_dir = self.storage_path.join("branches").join(branch_name);
             if branch_dir.exists() {
-                fs::remove_dir_all(&branch_dir)?;
+                remove_branch_store_dir_all(&branch_dir)?;
             }
 
             self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -1390,7 +1475,7 @@ impl BranchManager {
         branches.remove(branch_name);
         let branch_dir = self.storage_path.join("branches").join(branch_name);
         if branch_dir.exists() {
-            fs::remove_dir_all(&branch_dir)?;
+            remove_branch_store_dir_all(&branch_dir)?;
         }
 
         // Invalidate kernel cache for this branch only
@@ -1412,10 +1497,14 @@ impl BranchManager {
     where
         F: FnMut(&str, &Path) -> Result<()>,
     {
-        if !dir.exists() {
-            return Ok(());
+        match dir.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
         }
 
+        let _guard = StoreDirModeGuard::new(dir)?;
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -1447,6 +1536,22 @@ mod branch_manager_tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    #[cfg(unix)]
+    struct ModeReset(Vec<PathBuf>);
+
+    #[cfg(unix)]
+    impl Drop for ModeReset {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+
+            for path in self.0.iter().rev() {
+                if path.exists() {
+                    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+                }
+            }
+        }
+    }
+
     struct TmpDir(PathBuf);
 
     impl TmpDir {
@@ -1472,6 +1577,15 @@ mod branch_manager_tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, data).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn make_mode_000_dir(path: &Path) -> ModeReset {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        ModeReset(vec![path.to_path_buf()])
     }
 
     fn manager(tmp: &TmpDir) -> BranchManager {
@@ -1607,6 +1721,74 @@ mod branch_manager_tests {
             .diff
             .iter()
             .any(|entry| entry.path == "/unchanged.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_status_survives_mode_000_delta_dir_and_reports_accessible_deltas() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        let _reset = mgr
+            .with_branch("work", |branch| {
+                write(&branch.delta_path("/new.txt"), b"new");
+                let scratch = branch.delta_path("/.scratch/cap-probe/kern-ovl-test/work/work");
+                Ok(make_mode_000_dir(&scratch))
+            })
+            .unwrap();
+
+        let status = mgr.branch_status("work").unwrap();
+
+        assert!(status.diff.iter().any(|entry| {
+            entry.op == "delta" && entry.kind == "file" && entry.path == "/new.txt"
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abort_discards_branch_with_mode_000_nested_delta_dir() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        let _reset = mgr
+            .with_branch("work", |branch| {
+                let scratch = branch.delta_path("/.scratch/cap-probe/kern-ovl-test/work/work");
+                Ok(make_mode_000_dir(&scratch))
+            })
+            .unwrap();
+
+        assert_eq!(mgr.abort("work").unwrap(), "main");
+        assert!(!mgr.is_branch_valid("work"));
+        assert!(!tmp.path().join("storage/branches/work").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_walks_mode_000_delta_dir_and_commits_files_inside_it() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        let _reset = mgr
+            .with_branch("work", |branch| {
+                let private = branch.delta_path("/private");
+                write(&private.join("inside.txt"), b"inside");
+                Ok(make_mode_000_dir(&private))
+            })
+            .unwrap();
+
+        assert_eq!(mgr.commit("work").unwrap(), "main");
+        assert_eq!(
+            fs::read(tmp.path().join("base/private/inside.txt")).unwrap(),
+            b"inside"
+        );
+        assert!(!mgr.is_branch_valid("work"));
+        assert!(!tmp.path().join("storage/branches/work").exists());
     }
 
     #[test]
