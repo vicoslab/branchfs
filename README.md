@@ -238,6 +238,30 @@ cat /mnt/workspace/@agent-b/solution.py  # still works
 
 All control-enabled mounts share a single branch namespace managed by the daemon. Branches created through any such mount are visible via `@branch` virtual paths. Mounts started with `--agent`/`--no-control` hide these control paths from the mounted tree. This simplifies multi-agent workflows — each agent accesses its branch via `/@branch-name/` without needing separate mount points.
 
+### Lazy live-base semantics and conflict handling
+
+Lazy branches are not frozen snapshots. Path resolution is always:
+
+```text
+branch delta > branch tombstone > current parent/base
+```
+
+A branch keeps seeing its own delta or tombstone for a touched path, even if
+another branch later commits the same path to the parent/base. Untouched
+inherited paths may reflect newer parent/base commits. Global epoch changes are
+cache-generation events; they should refresh/re-resolve mount state, not make a
+still-valid branch mount permanently return `ESTALE`.
+
+Commit conflict detection is path-level. BranchFS records parent/base identity
+when a branch first touches a path. If the parent/base version changed by commit
+time, regular text files should be attempted as git-style 3-way merges. Clean
+non-overlapping merges are committed as merged content and are not conflicts.
+Unclean overlapping edits, binary files, delete-vs-modify, type changes,
+symlinks/directories, or paths without merge-base content become conflict
+records. Low-level commit still succeeds by default; after auto-merge attempts,
+remaining conflicts use latest-session-wins semantics and should be reported in
+machine-readable form for supervisors such as `ccc-agent`.
+
 ### Commit
 
 Committing merges a **leaf branch** into its immediate parent:
