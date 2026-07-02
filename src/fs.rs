@@ -131,10 +131,19 @@ pub struct BranchFs {
     passthrough_enabled: bool,
     /// FUSE passthrough state (fh counter, backing_ids)
     passthrough_state: crate::platform::PassthroughState,
+    /// Whether the synthetic .branchfs_ctl and @branch namespace are exposed.
+    /// Agent mounts disable this so untrusted processes cannot switch/commit
+    /// through the mounted filesystem.
+    expose_control: bool,
 }
 
 impl BranchFs {
-    pub fn new(manager: Arc<BranchManager>, mountpoint: PathBuf, passthrough: bool) -> Self {
+    pub fn new(
+        manager: Arc<BranchManager>,
+        mountpoint: PathBuf,
+        passthrough: bool,
+        expose_control: bool,
+    ) -> Self {
         let current_epoch = manager.get_epoch();
         Self {
             manager,
@@ -151,6 +160,7 @@ impl BranchFs {
             write_cache: WriteFileCache::new(),
             passthrough_enabled: passthrough,
             passthrough_state: crate::platform::PassthroughState::new(),
+            expose_control,
         }
     }
 
@@ -158,6 +168,24 @@ impl BranchFs {
         self.manager
             .get_mount_branch(&self.mountpoint)
             .unwrap_or_else(|| "main".into())
+    }
+
+    pub(crate) fn branch_writable(&self, branch: &str) -> bool {
+        self.manager.is_branch_writable(branch)
+    }
+
+    pub(crate) fn write_denied_error(&self, branch: &str) -> Option<i32> {
+        if self.branch_writable(branch) {
+            None
+        } else {
+            Some(libc::EROFS)
+        }
+    }
+
+    fn flags_want_write(flags: i32) -> bool {
+        (flags & libc::O_ACCMODE) != libc::O_RDONLY
+            || (flags & libc::O_TRUNC) != 0
+            || (flags & libc::O_APPEND) != 0
     }
 
     pub(crate) fn is_stale(&self) -> bool {
@@ -231,10 +259,14 @@ impl BranchFs {
         let is_writable = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
 
         let backing_path = if is_writable {
+            if let Some(errno) = self.write_denied_error(branch) {
+                reply.error(errno);
+                return;
+            }
             match self.ensure_cow_for_branch(branch, rel_path) {
                 Ok(p) => p,
-                Err(_) => {
-                    reply.opened(0, 0);
+                Err(e) => {
+                    reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                     return;
                 }
             }
@@ -305,21 +337,23 @@ impl Filesystem for BranchFs {
         // === Root-level lookups (parent is /) ===
         if parent_path == "/" {
             // Root ctl file
-            if name_str == CTL_FILE {
+            if self.expose_control && name_str == CTL_FILE {
                 reply.entry(&TTL, &self.ctl_file_attr(CTL_INO), 0);
                 return;
             }
 
             // @branch virtual directory
-            if let Some(branch) = name_str.strip_prefix('@') {
-                if self.manager.is_branch_valid(branch) {
-                    let inode_path = format!("/@{}", branch);
-                    let ino = self.inodes.get_or_create(&inode_path, true);
-                    reply.entry(&TTL, &self.synthetic_dir_attr(ino), 0);
-                    return;
-                } else {
-                    reply.error(libc::ENOENT);
-                    return;
+            if self.expose_control {
+                if let Some(branch) = name_str.strip_prefix('@') {
+                    if self.manager.is_branch_valid(branch) {
+                        let inode_path = format!("/@{}", branch);
+                        let ino = self.inodes.get_or_create(&inode_path, true);
+                        reply.entry(&TTL, &self.synthetic_dir_attr(ino), 0);
+                        return;
+                    } else {
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
                 }
             }
 
@@ -358,7 +392,7 @@ impl Filesystem for BranchFs {
 
         if let Some((branch, parent_rel)) = branch_ctx {
             // Looking up .branchfs_ctl inside a branch dir (only at branch root)
-            if parent_rel == "/" && name_str == CTL_FILE {
+            if self.expose_control && parent_rel == "/" && name_str == CTL_FILE {
                 let ctl_ino = self.get_or_create_branch_ctl_ino(&branch);
                 reply.entry(&TTL, &self.ctl_file_attr(ctl_ino), 0);
                 return;
@@ -430,13 +464,17 @@ impl Filesystem for BranchFs {
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         // Root ctl file
         if ino == CTL_INO {
-            reply.attr(&TTL, &self.ctl_file_attr(CTL_INO));
+            if self.expose_control {
+                reply.attr(&TTL, &self.ctl_file_attr(CTL_INO));
+            } else {
+                reply.error(libc::ENOENT);
+            }
             return;
         }
 
         // Branch ctl file
         if let Some(branch) = self.branch_for_ctl_ino(ino) {
-            if self.manager.is_branch_valid(&branch) {
+            if self.expose_control && self.manager.is_branch_valid(&branch) {
                 reply.attr(&TTL, &self.ctl_file_attr(ino));
             } else {
                 reply.error(libc::ENOENT);
@@ -465,7 +503,7 @@ impl Filesystem for BranchFs {
                 }
             }
             PathContext::BranchCtl(ref branch) => {
-                if self.manager.is_branch_valid(branch) {
+                if self.expose_control && self.manager.is_branch_valid(branch) {
                     reply.attr(&TTL, &self.ctl_file_attr(ino));
                 } else {
                     reply.error(libc::ENOENT);
@@ -489,7 +527,11 @@ impl Filesystem for BranchFs {
                 }
             }
             PathContext::RootCtl => {
-                reply.attr(&TTL, &self.ctl_file_attr(CTL_INO));
+                if self.expose_control {
+                    reply.attr(&TTL, &self.ctl_file_attr(CTL_INO));
+                } else {
+                    reply.error(libc::ENOENT);
+                }
             }
             PathContext::RootPath(ref rp) => {
                 if ino != ROOT_INO && self.is_stale() {
@@ -528,6 +570,10 @@ impl Filesystem for BranchFs {
     ) {
         // Reading root ctl file returns the current branch name
         if ino == CTL_INO {
+            if !self.expose_control {
+                reply.error(libc::ENOENT);
+                return;
+            }
             let branch = self.get_branch_name();
             let bytes = branch.as_bytes();
             let off = offset as usize;
@@ -668,13 +714,21 @@ impl Filesystem for BranchFs {
 
         // === Root ctl file ===
         if ino == CTL_INO {
-            self.handle_root_ctl_write(data, reply);
+            if self.expose_control {
+                self.handle_root_ctl_write(data, reply);
+            } else {
+                reply.error(libc::EPERM);
+            }
             return;
         }
 
         // === Per-branch ctl file ===
         if let Some(branch) = self.branch_for_ctl_ino(ino) {
-            self.handle_branch_ctl_write(&branch, data, reply);
+            if self.expose_control {
+                self.handle_branch_ctl_write(&branch, data, reply);
+            } else {
+                reply.error(libc::EPERM);
+            }
             return;
         }
 
@@ -731,22 +785,26 @@ impl Filesystem for BranchFs {
                 return;
             }
             PathContext::BranchPath(branch, rel_path) => {
+                if let Some(errno) = self.write_denied_error(&branch) {
+                    reply.error(errno);
+                    return;
+                }
                 if !self.manager.is_branch_valid(&branch) {
                     reply.error(libc::ENOENT);
                     return;
                 }
                 match self.ensure_cow_for_branch(&branch, &rel_path) {
                     Ok(p) => (p, false),
-                    Err(_) => {
-                        reply.error(libc::EIO);
+                    Err(e) => {
+                        reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                         return;
                     }
                 }
             }
             _ => match self.ensure_cow(&path) {
                 Ok(p) => (p, true),
-                Err(_) => {
-                    reply.error(libc::EIO);
+                Err(e) => {
+                    reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                     return;
                 }
             },
@@ -832,9 +890,11 @@ impl Filesystem for BranchFs {
                 let inode_prefix = format!("/@{}", branch);
                 let mut entries = self.collect_readdir_entries(&branch, "/", ino, &inode_prefix);
 
-                // Add .branchfs_ctl
-                let ctl_ino = self.get_or_create_branch_ctl_ino(&branch);
-                entries.push((ctl_ino, FileType::RegularFile, CTL_FILE.to_string()));
+                // Add .branchfs_ctl when this is a control-enabled mount.
+                if self.expose_control {
+                    let ctl_ino = self.get_or_create_branch_ctl_ino(&branch);
+                    entries.push((ctl_ino, FileType::RegularFile, CTL_FILE.to_string()));
+                }
 
                 for (i, (e_ino, kind, name)) in
                     entries.into_iter().enumerate().skip(offset as usize)
@@ -874,18 +934,20 @@ impl Filesystem for BranchFs {
                 let branch_name = self.get_branch_name();
                 let mut entries = self.collect_readdir_entries(&branch_name, "/", ino, "");
 
-                // Add .branchfs_ctl
-                entries.push((CTL_INO, FileType::RegularFile, CTL_FILE.to_string()));
+                if self.expose_control {
+                    // Add .branchfs_ctl
+                    entries.push((CTL_INO, FileType::RegularFile, CTL_FILE.to_string()));
 
-                // Add @branch virtual dirs for branches that are children of
-                // the root's current branch (i.e. main's children typically)
-                // We list ALL non-main branches as @branch dirs at root level.
-                let branches = self.manager.list_branches();
-                for (bname, _parent) in branches {
-                    if bname != "main" {
-                        let inode_path = format!("/@{}", bname);
-                        let bino = self.inodes.get_or_create(&inode_path, true);
-                        entries.push((bino, FileType::Directory, format!("@{}", bname)));
+                    // Add @branch virtual dirs for branches that are children of
+                    // the root's current branch (i.e. main's children typically)
+                    // We list ALL non-main branches as @branch dirs at root level.
+                    let branches = self.manager.list_branches();
+                    for (bname, _parent) in branches {
+                        if bname != "main" {
+                            let inode_path = format!("/@{}", bname);
+                            let bino = self.inodes.get_or_create(&inode_path, true);
+                            entries.push((bino, FileType::Directory, format!("@{}", bname)));
+                        }
                     }
                 }
 
@@ -967,6 +1029,10 @@ impl Filesystem for BranchFs {
                 reply.error(libc::ENOENT);
                 return;
             }
+            if let Some(errno) = self.write_denied_error(&branch) {
+                reply.error(errno);
+                return;
+            }
             let rel_path = if parent_rel == "/" {
                 format!("/{}", name_str)
             } else {
@@ -1005,6 +1071,11 @@ impl Filesystem for BranchFs {
                         format!("{}/{}", rp, name_str)
                     };
 
+                    let current_branch = self.get_branch_name();
+                    if let Some(errno) = self.write_denied_error(&current_branch) {
+                        reply.error(errno);
+                        return;
+                    }
                     let delta = self.get_delta_path(&path);
                     if storage::ensure_parent_dirs(&delta).is_err() {
                         reply.error(libc::EIO);
@@ -1066,6 +1137,10 @@ impl Filesystem for BranchFs {
                 reply.error(libc::ENOENT);
                 return;
             }
+            if let Some(errno) = self.write_denied_error(&branch) {
+                reply.error(errno);
+                return;
+            }
 
             let rel_path = if parent_rel == "/" {
                 format!("/{}", name_str)
@@ -1073,16 +1148,7 @@ impl Filesystem for BranchFs {
                 format!("{}/{}", parent_rel, name_str)
             };
 
-            let result = self.manager.with_branch(&branch, |b| {
-                b.add_tombstone(&rel_path)?;
-                let delta = b.delta_path(&rel_path);
-                if delta.exists() {
-                    let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-                    std::fs::remove_file(&delta)?;
-                    self.manager.quota.sub(freed);
-                }
-                Ok(())
-            });
+            let result = self.manager.delete_path_in_branch(&branch, &rel_path);
 
             if result.is_err() {
                 reply.error(libc::EIO);
@@ -1105,16 +1171,12 @@ impl Filesystem for BranchFs {
                         format!("{}/{}", rp, name_str)
                     };
 
-                    let result = self.manager.with_branch(&self.get_branch_name(), |b| {
-                        b.add_tombstone(&path)?;
-                        let delta = b.delta_path(&path);
-                        if delta.exists() {
-                            let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-                            std::fs::remove_file(&delta)?;
-                            self.manager.quota.sub(freed);
-                        }
-                        Ok(())
-                    });
+                    let current_branch = self.get_branch_name();
+                    if let Some(errno) = self.write_denied_error(&current_branch) {
+                        reply.error(errno);
+                        return;
+                    }
+                    let result = self.manager.delete_path_in_branch(&current_branch, &path);
 
                     if result.is_err() || self.is_stale() {
                         reply.error(libc::ESTALE);
@@ -1214,6 +1276,10 @@ impl Filesystem for BranchFs {
             }
             src_branch
         };
+        if let Some(errno) = self.write_denied_error(&branch) {
+            reply.error(errno);
+            return;
+        }
 
         let join_rel = |parent_rel: &str, child: &str| -> String {
             if parent_rel == "/" {
@@ -1230,6 +1296,10 @@ impl Filesystem for BranchFs {
             reply.error(libc::ENOENT);
             return;
         }
+        let src_inherited = self
+            .manager
+            .inherited_path_exists(&branch, &src_rel)
+            .unwrap_or(false);
 
         // RENAME_NOREPLACE
         if crate::platform::check_rename_noreplace(flags)
@@ -1276,9 +1346,17 @@ impl Filesystem for BranchFs {
             return;
         }
 
-        // Update tombstones: mark src deleted, revive dst, tombstone old dst
+        // Update tombstones: only hide the old source if it also existed in
+        // the inherited view. Branch-local temps (e.g. bash history rename
+        // scratch files) should disappear completely, not become delete
+        // tombstones in review status. Revive the destination because its delta
+        // now provides the visible entry.
         let result = self.manager.with_branch(&branch, |b| {
-            b.add_tombstone(&src_rel)?;
+            if src_inherited {
+                b.add_tombstone(&src_rel)?;
+            } else {
+                b.remove_tombstone(&src_rel);
+            }
             if dst_existed {
                 b.add_tombstone(&dst_rel)?;
             }
@@ -1337,6 +1415,12 @@ impl Filesystem for BranchFs {
                 reply.opened(0, 0);
             }
             PathContext::BranchPath(branch, rel_path) => {
+                if Self::flags_want_write(flags) {
+                    if let Some(errno) = self.write_denied_error(&branch) {
+                        reply.error(errno);
+                        return;
+                    }
+                }
                 if !self.manager.is_branch_valid(&branch) {
                     reply.error(libc::ENOENT);
                     return;
@@ -1370,6 +1454,12 @@ impl Filesystem for BranchFs {
                     }
                 };
                 let branch_name = self.get_branch_name();
+                if Self::flags_want_write(flags) {
+                    if let Some(errno) = self.write_denied_error(&branch_name) {
+                        reply.error(errno);
+                        return;
+                    }
+                }
                 self.manager.register_opened_inode(&branch_name, ino);
 
                 if self.passthrough_enabled {
@@ -1423,13 +1513,17 @@ impl Filesystem for BranchFs {
 
         // Handle root ctl file (virtual — not in inode table)
         if ino == CTL_INO {
-            reply.attr(&TTL, &self.ctl_file_attr(CTL_INO));
+            if self.expose_control {
+                reply.attr(&TTL, &self.ctl_file_attr(CTL_INO));
+            } else {
+                reply.error(libc::ENOENT);
+            }
             return;
         }
 
         // Handle per-branch ctl files (virtual — not in inode table)
         if let Some(branch) = self.branch_for_ctl_ino(ino) {
-            if self.manager.is_branch_valid(&branch) {
+            if self.expose_control && self.manager.is_branch_valid(&branch) {
                 reply.attr(&TTL, &self.ctl_file_attr(ino));
             } else {
                 reply.error(libc::ENOENT);
@@ -1450,6 +1544,18 @@ impl Filesystem for BranchFs {
                 reply.error(libc::EPERM);
             }
             PathContext::BranchPath(branch, rel_path) => {
+                if size.is_some()
+                    || mode.is_some()
+                    || uid.is_some()
+                    || gid.is_some()
+                    || atime.is_some()
+                    || mtime.is_some()
+                {
+                    if let Some(errno) = self.write_denied_error(&branch) {
+                        reply.error(errno);
+                        return;
+                    }
+                }
                 if !self.manager.is_branch_valid(&branch) {
                     reply.error(libc::ENOENT);
                     return;
@@ -1501,6 +1607,19 @@ impl Filesystem for BranchFs {
             }
             _ => {
                 // Root path (existing logic)
+                if size.is_some()
+                    || mode.is_some()
+                    || uid.is_some()
+                    || gid.is_some()
+                    || atime.is_some()
+                    || mtime.is_some()
+                {
+                    let current_branch = self.get_branch_name();
+                    if let Some(errno) = self.write_denied_error(&current_branch) {
+                        reply.error(errno);
+                        return;
+                    }
+                }
                 if let Some(new_size) = size {
                     match self.ensure_cow(&path) {
                         Ok(delta) => {
@@ -1671,6 +1790,10 @@ impl Filesystem for BranchFs {
                 reply.error(libc::ENOENT);
                 return;
             }
+            if let Some(errno) = self.write_denied_error(&branch) {
+                reply.error(errno);
+                return;
+            }
             let rel_path = if parent_rel == "/" {
                 format!("/{}", name_str)
             } else {
@@ -1704,6 +1827,11 @@ impl Filesystem for BranchFs {
                         format!("{}/{}", rp, name_str)
                     };
 
+                    let current_branch = self.get_branch_name();
+                    if let Some(errno) = self.write_denied_error(&current_branch) {
+                        reply.error(errno);
+                        return;
+                    }
                     let delta = self.get_delta_path(&path);
                     match std::fs::create_dir_all(&delta) {
                         Ok(_) => {
@@ -1805,6 +1933,10 @@ impl Filesystem for BranchFs {
                 reply.error(libc::ENOENT);
                 return;
             }
+            if let Some(errno) = self.write_denied_error(&branch) {
+                reply.error(errno);
+                return;
+            }
             let rel_path = if parent_rel == "/" {
                 format!("/{}", name_str)
             } else {
@@ -1837,6 +1969,11 @@ impl Filesystem for BranchFs {
                     } else {
                         format!("{}/{}", rp, name_str)
                     };
+                    let current_branch = self.get_branch_name();
+                    if let Some(errno) = self.write_denied_error(&current_branch) {
+                        reply.error(errno);
+                        return;
+                    }
                     let delta = self.get_delta_path(&path);
                     if storage::ensure_parent_dirs(&delta).is_err() {
                         reply.error(libc::EIO);
@@ -1934,7 +2071,7 @@ mod tests {
         let mgr = test_manager();
         let mp = PathBuf::from("/mnt/a");
         mgr.set_mount_branch(&mp, "main");
-        let fs = BranchFs::new(mgr.clone(), mp, false);
+        let fs = BranchFs::new(mgr.clone(), mp, false, true);
 
         assert!(!fs.is_stale());
     }
@@ -1947,7 +2084,7 @@ mod tests {
         let mgr = test_manager();
         let mp = PathBuf::from("/mnt/a");
         mgr.set_mount_branch(&mp, "main");
-        let fs = BranchFs::new(mgr.clone(), mp, false);
+        let fs = BranchFs::new(mgr.clone(), mp, false, true);
         assert!(!fs.is_stale());
 
         mgr.create_branch("feat", "main").unwrap();
@@ -1966,7 +2103,7 @@ mod tests {
         let mp = PathBuf::from("/mnt/a");
         mgr.create_branch("feat", "main").unwrap();
         mgr.set_mount_branch(&mp, "feat");
-        let fs = BranchFs::new(mgr.clone(), mp, false);
+        let fs = BranchFs::new(mgr.clone(), mp, false, true);
         assert!(!fs.is_stale());
 
         mgr.abort("feat").unwrap();

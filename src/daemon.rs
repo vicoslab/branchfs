@@ -12,9 +12,13 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::process::{Command, Stdio};
 
-use crate::branch::BranchManager;
+use crate::branch::{BranchManager, InheritanceMode};
 use crate::error::Result;
 use crate::fs::BranchFs;
+
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -24,6 +28,10 @@ pub enum Request {
         mountpoint: String,
         #[serde(default)]
         passthrough: bool,
+        #[serde(default = "default_true")]
+        control: bool,
+        #[serde(default)]
+        allow_other: bool,
     },
     Unmount {
         mountpoint: String,
@@ -31,6 +39,26 @@ pub enum Request {
     Create {
         name: String,
         parent: String,
+        #[serde(default = "default_true")]
+        lazy: bool,
+        /// Inherited paths to mask from this branch's view (secret hiding).
+        #[serde(default)]
+        hide: Vec<String>,
+    },
+    Freeze {
+        branch: String,
+    },
+    Thaw {
+        branch: String,
+    },
+    Status {
+        branch: String,
+    },
+    CommitBranch {
+        branch: String,
+    },
+    AbortBranch {
+        branch: String,
     },
     GetMountBranch {
         mountpoint: String,
@@ -96,14 +124,6 @@ impl Daemon {
     ) -> Result<Self> {
         let socket_path = storage_path.join("daemon.sock");
 
-        // Clean up branches from previous daemon run for fresh state
-        let branches_dir = storage_path.join("branches");
-        if branches_dir.exists() {
-            if let Err(e) = fs::remove_dir_all(&branches_dir) {
-                log::warn!("Failed to clean up branches directory: {}", e);
-            }
-        }
-
         // Also clean up legacy mounts directory if present
         let mounts_dir = storage_path.join("mounts");
         if mounts_dir.exists() {
@@ -142,18 +162,35 @@ impl Daemon {
         branch_name: &str,
         mountpoint: &Path,
         passthrough: bool,
+        control: bool,
+        allow_other: bool,
     ) -> Result<()> {
+        if !self.manager.is_branch_valid(branch_name) {
+            return Err(crate::error::BranchError::NotFound(branch_name.to_string()));
+        }
         // Register the mount branch *before* creating BranchFs so get_branch_name() works
         self.manager.set_mount_branch(mountpoint, branch_name);
 
-        let fs = BranchFs::new(self.manager.clone(), mountpoint.to_path_buf(), passthrough);
+        let fs = BranchFs::new(
+            self.manager.clone(),
+            mountpoint.to_path_buf(),
+            passthrough,
+            control,
+        );
         let mut options = vec![MountOption::FSName("branchfs".to_string())];
         options.extend(crate::platform::get_mount_options());
+        if allow_other {
+            // Lets a non-root agent uid access a view mounted by the root
+            // daemon (privilege-separated chroot model).  Root may set this
+            // without `user_allow_other` in /etc/fuse.conf.
+            options.push(MountOption::AllowOther);
+        }
 
         log::info!(
-            "Spawning mount for branch '{}' at {:?}",
+            "Spawning mount for branch '{}' at {:?} (control={})",
             branch_name,
             mountpoint,
+            control,
         );
 
         let session = match fuser::spawn_mount2(fs, mountpoint, &options) {
@@ -220,8 +257,20 @@ impl Daemon {
         self.mounts.lock().len()
     }
 
-    pub fn create_branch(&self, name: &str, parent: &str) -> Result<()> {
-        self.manager.create_branch(name, parent)
+    pub fn create_branch(
+        &self,
+        name: &str,
+        parent: &str,
+        lazy: bool,
+        hide: Vec<String>,
+    ) -> Result<()> {
+        let mode = if lazy {
+            InheritanceMode::Lazy
+        } else {
+            InheritanceMode::Snapshot
+        };
+        self.manager
+            .create_branch_with_options(name, parent, mode, hide)
     }
 
     pub fn list_branches(&self) -> Vec<(String, Option<String>)> {
@@ -306,12 +355,14 @@ impl Daemon {
                 branch,
                 mountpoint,
                 passthrough,
+                control,
+                allow_other,
             } => {
                 let path = PathBuf::from(&mountpoint);
                 if let Err(e) = fs::create_dir_all(&path) {
                     return Response::error(&format!("Failed to create mountpoint: {}", e));
                 }
-                match self.spawn_mount(&branch, &path, passthrough) {
+                match self.spawn_mount(&branch, &path, passthrough, control, allow_other) {
                     Ok(()) => Response::success(),
                     Err(e) => Response::error(&format!("{}", e)),
                 }
@@ -323,8 +374,36 @@ impl Daemon {
                     Err(e) => Response::error(&format!("{}", e)),
                 }
             }
-            Request::Create { name, parent } => match self.create_branch(&name, &parent) {
+            Request::Create {
+                name,
+                parent,
+                lazy,
+                hide,
+            } => match self.create_branch(&name, &parent, lazy, hide) {
                 Ok(()) => Response::success(),
+                Err(e) => Response::error(&format!("{}", e)),
+            },
+            Request::Freeze { branch } => match self.manager.freeze_branch(&branch) {
+                Ok(()) => Response::success(),
+                Err(e) => Response::error(&format!("{}", e)),
+            },
+            Request::Thaw { branch } => match self.manager.thaw_branch(&branch) {
+                Ok(()) => Response::success(),
+                Err(e) => Response::error(&format!("{}", e)),
+            },
+            Request::Status { branch } => match self.manager.branch_status(&branch) {
+                Ok(status) => match serde_json::to_value(status) {
+                    Ok(value) => Response::success_with_data(value),
+                    Err(e) => Response::error(&format!("{}", e)),
+                },
+                Err(e) => Response::error(&format!("{}", e)),
+            },
+            Request::CommitBranch { branch } => match self.manager.commit(&branch) {
+                Ok(parent) => Response::success_with_data(serde_json::json!({ "parent": parent })),
+                Err(e) => Response::error(&format!("{}", e)),
+            },
+            Request::AbortBranch { branch } => match self.manager.abort(&branch) {
+                Ok(parent) => Response::success_with_data(serde_json::json!({ "parent": parent })),
                 Err(e) => Response::error(&format!("{}", e)),
             },
             Request::GetMountBranch { mountpoint } => {
@@ -339,11 +418,9 @@ impl Daemon {
                 let branches: Vec<_> = self
                     .list_branches()
                     .into_iter()
-                    .map(|(name, parent)| {
-                        serde_json::json!({
-                            "name": name,
-                            "parent": parent
-                        })
+                    .filter_map(|(name, _parent)| self.manager.branch_status(&name).ok())
+                    .map(|status| {
+                        serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({}))
                     })
                     .collect();
                 Response::success_with_data(serde_json::json!(branches))

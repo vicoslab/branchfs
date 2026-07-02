@@ -48,6 +48,10 @@ impl BranchFs {
         branch: &str,
         rel_path: &str,
     ) -> std::io::Result<std::path::PathBuf> {
+        if !self.branch_writable(branch) {
+            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+        }
+
         let delta = self.get_delta_path_for_branch(branch, rel_path);
 
         if delta.symlink_metadata().is_err() {
@@ -146,9 +150,9 @@ impl BranchFs {
 
     /// Collect readdir entries for a directory resolved via a specific branch.
     ///
-    /// Collects candidate names from the branch delta plus its frozen inherited
-    /// snapshot, then resolves each via `resolve_path` to respect tombstones and
-    /// determine the correct file type.
+    /// Collects candidate names from the branch delta plus its inherited view
+    /// (lazy parent/base lookup or snapshot mode), then resolves each via
+    /// `resolve_path` to respect tombstones and determine the correct file type.
     ///
     /// `inode_prefix` controls how child inode paths are formed:
     /// - `"/@branch"` for branch subtrees (produces `/@branch/child`)
