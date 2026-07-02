@@ -190,8 +190,17 @@ impl BranchFs {
 
     pub(crate) fn is_stale(&self) -> bool {
         let branch_name = self.get_branch_name();
-        self.manager.get_epoch() != self.current_epoch.load(Ordering::SeqCst)
-            || !self.manager.is_branch_valid(&branch_name)
+        let manager_epoch = self.manager.get_epoch();
+        let mount_epoch = self.current_epoch.load(Ordering::SeqCst);
+        if manager_epoch != mount_epoch {
+            // A global epoch change means some branch lifecycle operation happened
+            // elsewhere. Refresh this mount's epoch so per-inode fd caches keyed by
+            // the old epoch are bypassed, but do not mark a still-valid mounted
+            // branch permanently stale. Long-lived agent mounts must survive
+            // unrelated branch create/commit/freeze/thaw operations.
+            self.current_epoch.store(manager_epoch, Ordering::SeqCst);
+        }
+        !self.manager.is_branch_valid(&branch_name)
     }
 
     /// Switch to a different branch (used after commit/abort to switch to parent)
@@ -586,11 +595,11 @@ impl Filesystem for BranchFs {
             return;
         }
 
-        // Honor staleness before serving a cached fd, exactly like the slow path
-        // and every other callback. A foreign commit (epoch arm) or abort
-        // (is_branch_valid arm) must surface as ESTALE, not a read from a stale
-        // backing file (issue #30). This still skips the resolve()/File::open()
-        // the cache exists to avoid.
+        // Refresh staleness/epoch before serving a cached fd, exactly like the
+        // slow path and every other callback. A foreign branch lifecycle event
+        // advances the global epoch; is_stale() refreshes this mount's epoch so
+        // fd caches keyed by the old epoch are bypassed. If the mounted branch
+        // itself was removed, it still surfaces as ESTALE.
         if self.is_stale() {
             reply.error(libc::ESTALE);
             return;
@@ -732,9 +741,11 @@ impl Filesystem for BranchFs {
             return;
         }
 
-        // Same staleness gate as read(): never write through a cached fd after a
-        // foreign commit/abort (issue #30). Placed after the ctl handlers so
-        // commit/abort ctl writes are not themselves gated.
+        // Same staleness/epoch refresh as read(): never write through a cached
+        // fd after another branch lifecycle event changes the global epoch, and
+        // still reject writes if the mounted branch itself was removed. Placed
+        // after the ctl handlers so commit/abort ctl writes are not themselves
+        // gated.
         if self.is_stale() {
             reply.error(libc::ESTALE);
             return;
@@ -2077,20 +2088,36 @@ mod tests {
     }
 
     #[test]
-    fn is_stale_true_after_foreign_commit() {
-        // A commit elsewhere advances the global epoch; this mount's local epoch
-        // lags, so the epoch arm of is_stale() fires. This is what gates the
-        // fast paths against reading a backing file a commit just replaced.
+    fn is_stale_false_after_unrelated_branch_epoch_change() {
+        // Long-lived agent mounts must survive unrelated branch lifecycle events.
+        // A foreign create/commit advances the manager epoch so caches need a new
+        // epoch key, but the mounted branch is still valid and should not return
+        // ESTALE for every path.
         let mgr = test_manager();
         let mp = PathBuf::from("/mnt/a");
-        mgr.set_mount_branch(&mp, "main");
+        mgr.create_branch("agent", "main").unwrap();
+        mgr.set_mount_branch(&mp, "agent");
         let fs = BranchFs::new(mgr.clone(), mp, false, true);
         assert!(!fs.is_stale());
 
-        mgr.create_branch("feat", "main").unwrap();
-        mgr.commit("feat").unwrap();
+        mgr.create_branch("other", "main").unwrap();
+        mgr.commit("other").unwrap();
+        let manager_epoch = mgr.get_epoch();
+        assert_ne!(
+            fs.current_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            manager_epoch,
+            "test setup should leave the mount epoch behind the manager epoch"
+        );
 
-        assert!(fs.is_stale(), "a foreign commit must make the mount stale");
+        assert!(
+            !fs.is_stale(),
+            "an unrelated branch epoch change must not stale a still-valid mount"
+        );
+        assert_eq!(
+            fs.current_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            manager_epoch,
+            "checking staleness should refresh the mount epoch so fd caches miss"
+        );
     }
 
     #[test]
@@ -2098,7 +2125,7 @@ mod tests {
         // Abort removes the branch but does NOT bump the epoch — staleness is
         // signaled through is_branch_valid(). This is how ESTALE implements
         // abort, and why the fast-path gate must call full is_stale(), not just
-        // compare epochs.
+        // refresh epoch keys.
         let mgr = test_manager();
         let mp = PathBuf::from("/mnt/a");
         mgr.create_branch("feat", "main").unwrap();
