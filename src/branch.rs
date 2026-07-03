@@ -697,6 +697,12 @@ impl Branch {
         if !tombstones_file.exists() {
             File::create(&tombstones_file)?;
         }
+        Self::migrate_legacy_touch_and_tombstone_snapshots(
+            &touches_file,
+            &touches_log_file,
+            &tombstones_file,
+            &tombstones_log_file,
+        )?;
         let tombstones = Self::load_tombstones(&tombstones_file, &tombstones_log_file)?;
         let touches = Self::load_touches(&touches_file, &touches_log_file)?;
 
@@ -767,6 +773,81 @@ impl Branch {
     pub fn set_state(&self, state: BranchState) -> Result<()> {
         *self.state.write() = state;
         self.write_metadata()
+    }
+
+    fn migrate_legacy_touch_and_tombstone_snapshots(
+        touches_file: &Path,
+        touches_log_file: &Path,
+        tombstones_file: &Path,
+        tombstones_log_file: &Path,
+    ) -> Result<()> {
+        Self::migrate_legacy_touches(touches_file, touches_log_file)?;
+        Self::migrate_legacy_tombstones(tombstones_file, tombstones_log_file)?;
+        Ok(())
+    }
+
+    fn migrate_legacy_tombstones(snapshot_path: &Path, log_path: &Path) -> Result<()> {
+        if !snapshot_path.exists() {
+            return Ok(());
+        }
+        let file = File::open(snapshot_path)?;
+        let mut paths = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if !line.trim().is_empty() {
+                paths.push(line);
+            }
+        }
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut migrated = Vec::new();
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            writeln!(&mut migrated, "+ {}", path)?;
+        }
+        if log_path.exists() {
+            migrated.extend(fs::read(log_path)?);
+        }
+        storage::ensure_parent_dirs(log_path)?;
+        let tmp = log_path.with_extension(format!("log.tmp.{}", uuid::Uuid::new_v4()));
+        fs::write(&tmp, migrated)?;
+        fs::rename(&tmp, log_path)?;
+        fs::write(snapshot_path, b"")?;
+        Ok(())
+    }
+
+    fn migrate_legacy_touches(snapshot_path: &Path, log_path: &Path) -> Result<()> {
+        if !snapshot_path.exists() {
+            return Ok(());
+        }
+        let data = fs::read(snapshot_path)?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let touches: HashMap<String, TouchRecord> = serde_json::from_slice(&data)?;
+        if touches.is_empty() {
+            return Ok(());
+        }
+
+        let mut records: Vec<_> = touches.into_values().collect();
+        records.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut migrated = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut migrated, &record)?;
+            writeln!(&mut migrated)?;
+        }
+        if log_path.exists() {
+            migrated.extend(fs::read(log_path)?);
+        }
+        storage::ensure_parent_dirs(log_path)?;
+        let tmp = log_path.with_extension(format!("log.tmp.{}", uuid::Uuid::new_v4()));
+        fs::write(&tmp, migrated)?;
+        fs::rename(&tmp, log_path)?;
+        fs::write(snapshot_path, b"{}\n")?;
+        Ok(())
     }
 
     fn load_tombstones(snapshot_path: &Path, log_path: &Path) -> Result<HashSet<String>> {
@@ -2322,7 +2403,75 @@ mod branch_manager_tests {
     }
 
     #[test]
-    fn first_touch_appends_incrementally_without_rewriting_legacy_snapshot() {
+    fn legacy_touch_and_tombstone_snapshots_migrate_to_incremental_logs_on_load() {
+        let tmp = TmpDir::new();
+        let base = tmp.path().join("base");
+        let storage = tmp.path().join("storage");
+        let work = tmp.path().join("work");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&work).unwrap();
+
+        let mgr = BranchManager::new(storage.clone(), base.clone(), work.clone(), None).unwrap();
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        drop(mgr);
+
+        let branch_dir = storage.join("branches/work");
+        let touches_file = branch_dir.join("touches.json");
+        let touches_log = branch_dir.join("touches.log");
+        let tombstones_file = branch_dir.join("tombstones");
+        let tombstones_log = branch_dir.join("tombstones.log");
+        let legacy_touch = serde_json::json!({
+            "/legacy-touch": {
+                "path": "/legacy-touch",
+                "base_at_first_touch": {
+                    "exists": false,
+                    "kind": "missing",
+                    "bytes": 0,
+                    "mtime_ns": null
+                }
+            }
+        });
+        fs::write(
+            &touches_file,
+            serde_json::to_vec_pretty(&legacy_touch).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &tombstones_file,
+            "/legacy-delete\n/removed-before-migration\n",
+        )
+        .unwrap();
+        fs::write(
+            &tombstones_log,
+            "- /removed-before-migration\n+ /already-logged\n",
+        )
+        .unwrap();
+        let _ = fs::remove_file(&touches_log);
+
+        let migrated = BranchManager::new(storage.clone(), base, work, None).unwrap();
+        let branches = migrated.branches.read();
+        let branch = branches.get("work").unwrap();
+        assert!(branch.get_touch_record("/legacy-touch").is_some());
+        assert!(branch.is_deleted("/legacy-delete"));
+        assert!(!branch.is_deleted("/removed-before-migration"));
+        assert!(branch.is_deleted("/already-logged"));
+        drop(branches);
+
+        let touch_log_text = fs::read_to_string(&touches_log).unwrap();
+        assert!(touch_log_text.contains("/legacy-touch"));
+        let tombstone_log_text = fs::read_to_string(&tombstones_log).unwrap();
+        assert!(
+            tombstone_log_text.starts_with("+ /legacy-delete\n+ /removed-before-migration\n"),
+            "legacy tombstone snapshot should be prepended before existing log ops"
+        );
+        assert!(tombstone_log_text.contains("- /removed-before-migration"));
+        assert_eq!(fs::read_to_string(&tombstones_file).unwrap(), "");
+        assert_eq!(fs::read_to_string(&touches_file).unwrap(), "{}\n");
+    }
+
+    #[test]
+    fn first_touch_appends_incrementally_after_migrating_legacy_snapshot() {
         let tmp = TmpDir::new();
         let base = tmp.path().join("base");
         let storage = tmp.path().join("storage");
@@ -2336,10 +2485,10 @@ mod branch_manager_tests {
         drop(mgr);
 
         // Simulate an existing large legacy touches.json snapshot from an old
-        // session. Recording one more first-touch must not rewrite this file:
-        // on NFS-backed CCC stores, repeatedly rewriting multi-MB JSON made
-        // deleting even an empty old .scratch/.ccc-storage directory take
-        // seconds.
+        // session. First load migrates it into touches.log and clears the
+        // legacy snapshot so future launches do not parse a multi-MB JSON map.
+        // Recording one more first-touch must append to the log without
+        // re-growing touches.json.
         let touches_file = storage.join("branches/work/touches.json");
         let legacy_snapshot = serde_json::json!({
             "/already-touched": {
@@ -2357,7 +2506,6 @@ mod branch_manager_tests {
             serde_json::to_vec_pretty(&legacy_snapshot).unwrap(),
         )
         .unwrap();
-        let before = fs::read(&touches_file).unwrap();
 
         fs::create_dir_all(base.join("empty-old-scratch/.ccc-storage")).unwrap();
         let mgr = BranchManager::new(storage.clone(), base, work, None).unwrap();
@@ -2365,13 +2513,17 @@ mod branch_manager_tests {
             .unwrap();
 
         assert_eq!(
-            fs::read(&touches_file).unwrap(),
-            before,
-            "recording an additional first-touch should append to touches.log, not rewrite touches.json"
+            fs::read_to_string(&touches_file).unwrap(),
+            "{}\n",
+            "legacy touches.json should stay compact after migration and first-touch append"
         );
 
         let touches_log = storage.join("branches/work/touches.log");
         let log = fs::read_to_string(&touches_log).expect("touches.log should be appended");
+        assert!(
+            log.contains("/already-touched"),
+            "incremental touch log should contain migrated legacy touch"
+        );
         assert!(
             log.contains("/empty-old-scratch"),
             "incremental touch log should contain the newly deleted directory"
@@ -2397,7 +2549,7 @@ mod branch_manager_tests {
     }
 
     #[test]
-    fn tombstone_removal_appends_incrementally_without_rewriting_legacy_snapshot() {
+    fn tombstone_removal_appends_incrementally_after_migrating_legacy_snapshot() {
         let tmp = TmpDir::new();
         let base = tmp.path().join("base");
         let storage = tmp.path().join("storage");
@@ -2416,23 +2568,27 @@ mod branch_manager_tests {
             "/old-empty-scratch\n/old-empty-scratch/.ccc-storage\n",
         )
         .unwrap();
-        let before = fs::read(&tombstones_file).unwrap();
 
         let mgr = BranchManager::new(storage.clone(), base, work, None).unwrap();
         // The inherited path is gone, so this delete is effectively clearing
-        // stale BranchFS overlay state. It must not rewrite a huge tombstones
-        // snapshot just to remove one stale path.
+        // stale BranchFS overlay state. First load migrates the old snapshot
+        // into tombstones.log; the removal must append there and keep the
+        // legacy tombstones file compact.
         mgr.delete_path_in_branch("work", "/old-empty-scratch")
             .unwrap();
 
         assert_eq!(
-            fs::read(&tombstones_file).unwrap(),
-            before,
-            "removing one stale tombstone should append to tombstones.log, not rewrite tombstones"
+            fs::read_to_string(&tombstones_file).unwrap(),
+            "",
+            "legacy tombstones file should stay compact after migration and removal"
         );
 
         let tombstones_log = storage.join("branches/work/tombstones.log");
         let log = fs::read_to_string(&tombstones_log).expect("tombstones.log should be appended");
+        assert!(
+            log.contains("+ /old-empty-scratch\n"),
+            "incremental tombstone log should contain migrated legacy tombstone"
+        );
         assert!(
             log.contains("- /old-empty-scratch"),
             "incremental tombstone log should record the removal"

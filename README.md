@@ -161,6 +161,7 @@ BranchFS must keep metadata-only operations responsive even when an agent create
 
 - `statfs`/`df -h` on a BranchFS mount must not hang behind `rm -rf` metadata traffic; slow unlink/rmdir work runs on an ordered background worker so filesystem operation order is preserved while the FUSE request loop remains responsive.
 - Per-path delete/write bookkeeping must be append-only/O(1) on the hot path; it must not rewrite multi-MB `touches.json` or `tombstones` snapshots for every file or for one stale empty directory.
+- Branch load migrates old-format `touches.json` and bare-line `tombstones` snapshots into `touches.log` and `tombstones.log`, then clears the legacy snapshots. This is an allowed one-time launch cost so old sessions do not keep paying multi-MB JSON/snapshot parse costs on every later daemon start.
 - BranchFS should not create tombstones for paths that were not present in the inherited view: unnecessary tombstones would hide future live-base files. The inherited-existence lookup is therefore still part of delete semantics, but it should be done once per first-touch and outside the FUSE request loop, not repeated or mixed with whole-metadata rewrites.
 - Recursive deletes must not read inherited file bodies merely to record conflict metadata. Deletes record path identity only; writes still keep bounded text content snapshots for later 3-way merge.
 - First-write COW of an inherited regular file must stage the copied file outside the visible delta tree, apply the write there, and atomically rename it into place. The copy/write work runs on the ordered background worker so `statfs` remains responsive, while same-path striped locks preserve concurrent writer semantics.
@@ -169,6 +170,7 @@ BranchFS must keep metadata-only operations responsive even when an agent create
 Non-privileged regression checks:
 
 ```bash
+cargo test legacy_touch_and_tombstone_snapshots_migrate_to_incremental_logs_on_load --lib
 cargo test appends_incrementally --lib
 cargo test blocking_fuse_work_is_spawned_off_the_request_loop --lib
 cargo test cow --lib
