@@ -1875,12 +1875,27 @@ impl BranchManager {
 
             let parent_files_dir = parent.files_dir.clone();
             let mut parent_tombstones = parent.get_tombstones();
+            let mut deleted_parent_delta_parents = Vec::new();
 
             let mut staged = StagedMerge::new();
             for tombstone in &child_tombstones {
                 let parent_delta = parent_files_dir.join(tombstone.trim_start_matches('/'));
+                let deleted_parent_delta_parent = parent_delta
+                    .symlink_metadata()
+                    .is_ok()
+                    .then(|| parent_delta.parent().map(Path::to_path_buf))
+                    .flatten();
+                let parent_inherited_exists =
+                    self.inherited_path_exists_locked(&branches, parent, tombstone)?;
                 staged.stage_delete(&parent_delta)?;
-                parent_tombstones.insert(tombstone.clone());
+                if let Some(parent_dir) = deleted_parent_delta_parent {
+                    deleted_parent_delta_parents.push(parent_dir);
+                }
+                if parent_inherited_exists {
+                    parent_tombstones.insert(tombstone.clone());
+                } else {
+                    parent_tombstones.remove(tombstone);
+                }
             }
             for (rel_path, src_path) in &delta_files {
                 let source = merge_sources.get(rel_path).unwrap_or(src_path);
@@ -1888,6 +1903,9 @@ impl BranchManager {
             }
 
             let copied_paths = staged.commit()?;
+            for parent_dir in deleted_parent_delta_parents {
+                Self::prune_empty_delta_parents(&parent_files_dir, Some(&parent_dir));
+            }
 
             for path in &copied_paths {
                 parent_tombstones.remove(path);
@@ -2534,6 +2552,42 @@ mod branch_manager_tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn nested_delete_of_parent_created_file_leaves_no_parent_tombstone() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        write_delta(&mgr, "work", "/tmp/session-only.tmp", b"transient");
+        mgr.create_branch_with_mode("child", "work", InheritanceMode::Lazy)
+            .unwrap();
+
+        mgr.delete_path_in_branch("child", "/tmp/session-only.tmp")
+            .unwrap();
+        let child_status = mgr.branch_status("child").unwrap();
+        assert_eq!(child_status.tombstones, 1);
+
+        assert_eq!(mgr.commit("child").unwrap(), "work");
+
+        let parent_status = mgr.branch_status("work").unwrap();
+        assert!(
+            parent_status.diff.is_empty(),
+            "nested create/delete should collapse to no-op, got {:?}",
+            parent_status.diff
+        );
+        mgr.with_branch("work", |branch| {
+            assert!(!branch.delta_path("/tmp/session-only.tmp").exists());
+            assert!(!branch.delta_path("/tmp").exists());
+            assert!(branch.get_tombstones().is_empty());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(mgr.commit("work").unwrap(), "main");
+        assert!(!tmp.path().join("base/tmp/session-only.tmp").exists());
     }
 
     #[test]
