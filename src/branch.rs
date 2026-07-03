@@ -1,6 +1,8 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{BranchError, Result};
 use crate::inode::ROOT_INO;
 use crate::storage;
+
+const PATH_LOCK_STRIPES: usize = 256;
 
 /// Tracks storage usage across all branches and enforces an optional quota.
 /// Only counts delta files (the actual disk cost of branching).
@@ -191,6 +195,24 @@ fn remove_branch_store_dir_all(path: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+fn invalid_offset() -> BranchError {
+    BranchError::Io(std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn file_too_large() -> BranchError {
+    BranchError::Io(std::io::Error::from_raw_os_error(libc::EFBIG))
+}
+
+fn write_data_to_file(path: &Path, offset: u64, data: &[u8]) -> Result<u32> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    Ok(file.write(data)? as u32)
 }
 
 /// An in-progress merge that prepares all of its destructive work as
@@ -580,6 +602,7 @@ pub struct Branch {
     tombstones_log_file: PathBuf,
     touches_log_file: PathBuf,
     touch_content_dir: PathBuf,
+    staging_dir: PathBuf,
     meta_file: PathBuf,
     pub inheritance: InheritanceMode,
     state: RwLock<BranchState>,
@@ -612,11 +635,13 @@ impl Branch {
         let touches_file = branch_dir.join("touches.json");
         let touches_log_file = branch_dir.join("touches.log");
         let touch_content_dir = branch_dir.join("touch-content");
+        let staging_dir = branch_dir.join("staging");
         let meta_file = branch_dir.join("meta.json");
 
         fs::create_dir_all(&files_dir)?;
         fs::create_dir_all(&inherited_dir)?;
         fs::create_dir_all(&touch_content_dir)?;
+        fs::create_dir_all(&staging_dir)?;
         if !tombstones_file.exists() {
             File::create(&tombstones_file)?;
         }
@@ -633,6 +658,7 @@ impl Branch {
             tombstones_log_file,
             touches_log_file,
             touch_content_dir,
+            staging_dir,
             meta_file,
             inheritance,
             state: RwLock::new(BranchState::Open),
@@ -658,6 +684,7 @@ impl Branch {
         let touches_file = branch_dir.join("touches.json");
         let touches_log_file = branch_dir.join("touches.log");
         let touch_content_dir = branch_dir.join("touch-content");
+        let staging_dir = branch_dir.join("staging");
         let meta_file = branch_dir.join("meta.json");
 
         let meta_data = fs::read_to_string(&meta_file)?;
@@ -666,6 +693,7 @@ impl Branch {
         fs::create_dir_all(&files_dir)?;
         fs::create_dir_all(&inherited_dir)?;
         fs::create_dir_all(&touch_content_dir)?;
+        fs::create_dir_all(&staging_dir)?;
         if !tombstones_file.exists() {
             File::create(&tombstones_file)?;
         }
@@ -681,6 +709,7 @@ impl Branch {
             tombstones_log_file,
             touches_log_file,
             touch_content_dir,
+            staging_dir,
             meta_file,
             inheritance: metadata.inheritance,
             state: RwLock::new(metadata.state),
@@ -946,6 +975,11 @@ impl Branch {
         self.files_dir.join(rel_path.trim_start_matches('/'))
     }
 
+    pub fn staging_path(&self) -> PathBuf {
+        self.staging_dir
+            .join(format!("cow-{}.tmp", uuid::Uuid::new_v4()))
+    }
+
     pub fn inherited_path(&self, rel_path: &str) -> PathBuf {
         self.inherited_dir.join(rel_path.trim_start_matches('/'))
     }
@@ -999,6 +1033,9 @@ pub struct BranchManager {
     mount_branches: RwLock<HashMap<PathBuf, String>>,
     /// Storage quota enforcement
     pub quota: StorageQuota,
+    /// Striped path locks serialize same-file COW/delete/write operations
+    /// without allocating one lock per path in large generated trees.
+    path_locks: Vec<Mutex<()>>,
 }
 
 impl BranchManager {
@@ -1057,7 +1094,16 @@ impl BranchManager {
             opened_inodes: Mutex::new(HashMap::new()),
             mount_branches: RwLock::new(HashMap::new()),
             quota,
+            path_locks: (0..PATH_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
         })
+    }
+
+    fn path_lock(&self, branch_name: &str, rel_path: &str) -> &Mutex<()> {
+        let mut hasher = DefaultHasher::new();
+        branch_name.hash(&mut hasher);
+        rel_path.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.path_locks.len();
+        &self.path_locks[idx]
     }
 
     /// Register a mount's initial branch (called before FUSE spawn).
@@ -1543,6 +1589,15 @@ impl BranchManager {
         branch_name: &str,
         rel_path: &str,
     ) -> Result<PathBuf> {
+        let _path_guard = self.path_lock(branch_name, rel_path).lock();
+        self.ensure_delta_path_for_write_locked(branch_name, rel_path)
+    }
+
+    fn ensure_delta_path_for_write_locked(
+        &self,
+        branch_name: &str,
+        rel_path: &str,
+    ) -> Result<PathBuf> {
         let branches = self.branches.read();
         let branch = branches
             .get(branch_name)
@@ -1578,6 +1633,93 @@ impl BranchManager {
         Ok(delta)
     }
 
+    pub fn write_data_to_branch(
+        &self,
+        branch_name: &str,
+        rel_path: &str,
+        offset: i64,
+        data: &[u8],
+    ) -> Result<u32> {
+        let offset = u64::try_from(offset).map_err(|_| invalid_offset())?;
+        let write_end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(file_too_large)?;
+
+        let _path_guard = self.path_lock(branch_name, rel_path).lock();
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+
+        if !branch.is_writable() {
+            return Err(BranchError::Invalid(format!(
+                "branch '{}' is frozen/read-only",
+                branch_name
+            )));
+        }
+
+        let delta = branch.delta_path(rel_path);
+        if delta.symlink_metadata().is_err() {
+            let inherited = self.resolve_inherited_for_touch_locked(&branches, branch, rel_path)?;
+            self.record_first_touch_locked(branch, rel_path, inherited.as_deref(), true)?;
+
+            if let Some(src) = inherited {
+                if let Ok(meta) = src.symlink_metadata() {
+                    if meta.file_type().is_file() {
+                        let final_size = meta.len().max(write_end);
+                        self.quota.check(final_size).map_err(|errno| {
+                            BranchError::Io(std::io::Error::from_raw_os_error(errno))
+                        })?;
+                        storage::ensure_parent_dirs(&delta)?;
+                        fs::create_dir_all(&branch.staging_dir)?;
+                        let staging = branch.staging_path();
+                        let result = (|| -> Result<(u32, u64)> {
+                            fs::copy(&src, &staging)?;
+                            let written = write_data_to_file(&staging, offset, data)?;
+                            let final_len = staging.metadata()?.len();
+                            fs::rename(&staging, &delta)?;
+                            Ok((written, final_len))
+                        })();
+                        match result {
+                            Ok((written, final_len)) => {
+                                self.quota.add(final_len);
+                                branch.remove_tombstone(rel_path)?;
+                                return Ok(written);
+                            }
+                            Err(e) => {
+                                let _ = fs::remove_file(&staging);
+                                return Err(e);
+                            }
+                        }
+                    } else if meta.file_type().is_symlink() {
+                        let src_size = meta.len();
+                        self.quota.check(src_size).map_err(|errno| {
+                            BranchError::Io(std::io::Error::from_raw_os_error(errno))
+                        })?;
+                        storage::copy_entry(&src, &delta)?;
+                        self.quota.add(src_size);
+                    }
+                }
+            }
+
+            storage::ensure_parent_dirs(&delta)?;
+        }
+
+        branch.remove_tombstone(rel_path)?;
+        let old_size = delta.metadata().map(|m| m.len()).unwrap_or(0);
+        if write_end > old_size {
+            self.quota
+                .check(write_end - old_size)
+                .map_err(|errno| BranchError::Io(std::io::Error::from_raw_os_error(errno)))?;
+        }
+        let written = write_data_to_file(&delta, offset, data)?;
+        let new_size = delta.metadata().map(|m| m.len()).unwrap_or(old_size);
+        if new_size > old_size {
+            self.quota.add(new_size - old_size);
+        }
+        Ok(written)
+    }
+
     fn prune_empty_delta_parents(files_dir: &Path, start: Option<&Path>) {
         let Some(start) = start else {
             return;
@@ -1598,6 +1740,7 @@ impl BranchManager {
     }
 
     pub fn delete_path_in_branch(&self, branch_name: &str, rel_path: &str) -> Result<()> {
+        let _path_guard = self.path_lock(branch_name, rel_path).lock();
         let branches = self.branches.read();
         let branch = branches
             .get(branch_name)
@@ -1631,6 +1774,14 @@ impl BranchManager {
             .read()
             .get(branch_name)
             .map(|b| b.is_writable())
+            .unwrap_or(false)
+    }
+
+    pub fn branch_has_delta(&self, branch_name: &str, rel_path: &str) -> bool {
+        self.branches
+            .read()
+            .get(branch_name)
+            .map(|b| b.has_delta(rel_path))
             .unwrap_or(false)
     }
 
@@ -2101,6 +2252,8 @@ mod branch_manager_tests {
     use super::{BranchManager, BranchState, InheritanceMode};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::thread;
 
     #[cfg(unix)]
     struct ModeReset(Vec<PathBuf>);
@@ -2344,6 +2497,42 @@ mod branch_manager_tests {
             record.base_content_key.is_some(),
             "write touches should keep inherited text contents for 3-way merge"
         );
+    }
+
+    #[test]
+    fn cow_write_to_inherited_file_preserves_unwritten_ranges() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/file.txt"), b"0123456789");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        let written = mgr
+            .write_data_to_branch("work", "/file.txt", 3, b"ABC")
+            .unwrap();
+
+        assert_eq!(written, 3);
+        let delta = tmp.path().join("storage/branches/work/files/file.txt");
+        assert_eq!(fs::read(&delta).unwrap(), b"012ABC6789");
+    }
+
+    #[test]
+    fn concurrent_cow_writes_to_same_inherited_file_preserve_both_writes() {
+        let tmp = TmpDir::new();
+        let mgr = Arc::new(manager(&tmp));
+        write(&tmp.path().join("base/file.txt"), b"0123456789");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        let a = mgr.clone();
+        let t1 = thread::spawn(move || a.write_data_to_branch("work", "/file.txt", 0, b"AA"));
+        let b = mgr.clone();
+        let t2 = thread::spawn(move || b.write_data_to_branch("work", "/file.txt", 8, b"BB"));
+
+        assert_eq!(t1.join().unwrap().unwrap(), 2);
+        assert_eq!(t2.join().unwrap().unwrap(), 2);
+        let delta = tmp.path().join("storage/branches/work/files/file.txt");
+        assert_eq!(fs::read(&delta).unwrap(), b"AA234567BB");
     }
 
     #[test]

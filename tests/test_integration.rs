@@ -4,6 +4,7 @@
 //! Run with: cargo test --test test_integration -- --ignored
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs as unix_fs;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -280,6 +281,63 @@ fn test_statfs_responsive_while_deleting_large_scratch_tree() {
             let _ = rm.kill();
             let _ = rm.wait();
             panic!("rm -rf .scratch did not finish within 30s");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+#[ignore]
+fn test_statfs_responsive_while_first_writing_large_inherited_file() {
+    let fix = TestFixture::new("statfs_cow_write");
+    let mut large = fs::File::create(fix.base.join("large.bin")).unwrap();
+    let chunk = vec![0x5au8; 1024 * 1024];
+    for _ in 0..64 {
+        large.write_all(&chunk).unwrap();
+    }
+    drop(large);
+
+    fix.mount();
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+    let target = bdir.join("large.bin");
+
+    let mut writer = Command::new("dd")
+        .arg("if=/dev/zero")
+        .arg(format!("of={}", target.display()))
+        .arg("bs=4096")
+        .arg("count=1")
+        .arg("conv=notrunc")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn first write to inherited large file");
+
+    for _ in 0..100 {
+        run_command_with_timeout(
+            Command::new("df").arg("-h").arg(&bdir),
+            Duration::from_secs(1),
+            "df -h during first-write COW",
+        );
+        if writer.try_wait().unwrap().is_some() {
+            assert_eq!(fs::metadata(&target).unwrap().len(), 64 * 1024 * 1024);
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let start = Instant::now();
+    loop {
+        if let Some(status) = writer.try_wait().unwrap() {
+            assert!(status.success(), "first-write COW exited with {}", status);
+            assert_eq!(fs::metadata(&target).unwrap().len(), 64 * 1024 * 1024);
+            return;
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = writer.kill();
+            let _ = writer.wait();
+            panic!("first-write COW did not finish within 60s");
         }
         thread::sleep(Duration::from_millis(50));
     }

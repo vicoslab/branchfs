@@ -252,6 +252,31 @@ impl BranchFs {
         });
     }
 
+    fn branch_error_errno(err: &BranchError) -> i32 {
+        match err {
+            BranchError::Io(e) => e.raw_os_error().unwrap_or(libc::EIO),
+            BranchError::NotFound(_) => libc::ENOENT,
+            BranchError::Invalid(_) => libc::EROFS,
+            _ => libc::EIO,
+        }
+    }
+
+    fn write_data_async(
+        manager: Arc<BranchManager>,
+        branch: String,
+        rel_path: String,
+        offset: i64,
+        data: Vec<u8>,
+        reply: ReplyWrite,
+    ) {
+        Self::spawn_blocking_work("branchfs-write", move || {
+            match manager.write_data_to_branch(&branch, &rel_path, offset, &data) {
+                Ok(n) => reply.written(n),
+                Err(e) => reply.error(Self::branch_error_errno(&e)),
+            }
+        });
+    }
+
     pub(crate) fn write_denied_error(&self, branch: &str) -> Option<i32> {
         if self.branch_writable(branch) {
             None
@@ -828,6 +853,10 @@ impl Filesystem for BranchFs {
             reply.error(libc::ESTALE);
             return;
         }
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
 
         let epoch = self.current_epoch.load(Ordering::SeqCst);
 
@@ -882,6 +911,17 @@ impl Filesystem for BranchFs {
                     reply.error(libc::ENOENT);
                     return;
                 }
+                if !self.manager.branch_has_delta(&branch, &rel_path) {
+                    Self::write_data_async(
+                        self.manager.clone(),
+                        branch,
+                        rel_path,
+                        offset,
+                        data.to_vec(),
+                        reply,
+                    );
+                    return;
+                }
                 match self.ensure_cow_for_branch(&branch, &rel_path) {
                     Ok(p) => (p, false),
                     Err(e) => {
@@ -890,13 +930,27 @@ impl Filesystem for BranchFs {
                     }
                 }
             }
-            _ => match self.ensure_cow(&path) {
-                Ok(p) => (p, true),
-                Err(e) => {
-                    reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+            _ => {
+                let current_branch = self.get_branch_name();
+                if !self.manager.branch_has_delta(&current_branch, &path) {
+                    Self::write_data_async(
+                        self.manager.clone(),
+                        current_branch,
+                        path.clone(),
+                        offset,
+                        data.to_vec(),
+                        reply,
+                    );
                     return;
                 }
-            },
+                match self.ensure_cow(&path) {
+                    Ok(p) => (p, true),
+                    Err(e) => {
+                        reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                        return;
+                    }
+                }
+            }
         };
 
         // Open delta for writing and cache the fd
