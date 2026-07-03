@@ -64,7 +64,7 @@ brew install macfuse pkg-config
 
 ### macOS Support
 
-BranchFS supports macOS via **macFUSE**. 
+BranchFS supports macOS via **macFUSE**.
 
 1. **Install macFUSE**: `brew install macfuse pkg-config`.
 2. **System Extension**: You must approve the `macFUSE` system extension in System Settings. On Apple Silicon Macs, you may need to enable third-party kernel extensions in Recovery Mode.
@@ -154,6 +154,33 @@ Useful commands for this mode:
 Relaxed multi-writer usage is intended for distributed jobs where nodes write different files in the same branch, e.g. per-host/per-rank logs and checkpoint shards. Concurrent writes/deletes/renames of the same path are not guaranteed.
 
 `--agent` is a security boundary helper: it hides the mounted control file and virtual branch namespace from the agent-visible tree. The trusted review/commit container must still keep real underlays and the BranchFS store/control channel out of the untrusted agent container.
+
+### CCC cleanup/performance regressions
+
+BranchFS must keep metadata-only operations responsive even when an agent creates or deletes large generated trees such as `.scratch` directories containing old `.ccc-storage` state. In particular:
+
+- `statfs`/`df -h` on a BranchFS mount must not hang behind `rm -rf` metadata traffic; slow unlink/rmdir work runs on an ordered background worker so filesystem operation order is preserved while the FUSE request loop remains responsive.
+- Per-path delete/write bookkeeping must be append-only/O(1) on the hot path; it must not rewrite multi-MB `touches.json` or `tombstones` snapshots for every file or for one stale empty directory.
+- BranchFS should not create tombstones for paths that were not present in the inherited view: unnecessary tombstones would hide future live-base files. The inherited-existence lookup is therefore still part of delete semantics, but it should be done once per first-touch and outside the FUSE request loop, not repeated or mixed with whole-metadata rewrites.
+- Recursive deletes must not read inherited file bodies merely to record conflict metadata. Deletes record path identity only; writes still keep bounded text content snapshots for later 3-way merge.
+- Future changes to first-touch or tombstone persistence should preserve the `touches.log` and `tombstones.log` incremental behavior unless they replace it with an equally bounded non-rewrite store.
+
+Non-privileged regression checks:
+
+```bash
+cargo test appends_incrementally --lib
+cargo test blocking_fuse_work_is_spawned_off_the_request_loop --lib
+```
+
+Real FUSE responsiveness check (ignored by default because it needs a working FUSE mount):
+
+```bash
+cargo test --test test_integration \
+  test_statfs_responsive_while_deleting_large_scratch_tree \
+  -- --ignored --nocapture
+```
+
+On CCC development containers, run these through the `branchfs-dev` conda environment described in `AGENTS.md` so `libfuse3` and the linker override are correct.
 
 ### Nested Branches
 

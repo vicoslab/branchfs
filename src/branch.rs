@@ -577,7 +577,8 @@ pub struct Branch {
     pub files_dir: PathBuf,
     pub inherited_dir: PathBuf,
     pub tombstones_file: PathBuf,
-    touches_file: PathBuf,
+    tombstones_log_file: PathBuf,
+    touches_log_file: PathBuf,
     touch_content_dir: PathBuf,
     meta_file: PathBuf,
     pub inheritance: InheritanceMode,
@@ -607,7 +608,9 @@ impl Branch {
         let files_dir = branch_dir.join("files");
         let inherited_dir = branch_dir.join("inherited");
         let tombstones_file = branch_dir.join("tombstones");
+        let tombstones_log_file = branch_dir.join("tombstones.log");
         let touches_file = branch_dir.join("touches.json");
+        let touches_log_file = branch_dir.join("touches.log");
         let touch_content_dir = branch_dir.join("touch-content");
         let meta_file = branch_dir.join("meta.json");
 
@@ -618,8 +621,8 @@ impl Branch {
             File::create(&tombstones_file)?;
         }
 
-        let tombstones = Self::load_tombstones(&tombstones_file)?;
-        let touches = Self::load_touches(&touches_file)?;
+        let tombstones = Self::load_tombstones(&tombstones_file, &tombstones_log_file)?;
+        let touches = Self::load_touches(&touches_file, &touches_log_file)?;
 
         let branch = Self {
             name: name.to_string(),
@@ -627,7 +630,8 @@ impl Branch {
             files_dir,
             inherited_dir,
             tombstones_file,
-            touches_file,
+            tombstones_log_file,
+            touches_log_file,
             touch_content_dir,
             meta_file,
             inheritance,
@@ -650,7 +654,9 @@ impl Branch {
         let files_dir = branch_dir.join("files");
         let inherited_dir = branch_dir.join("inherited");
         let tombstones_file = branch_dir.join("tombstones");
+        let tombstones_log_file = branch_dir.join("tombstones.log");
         let touches_file = branch_dir.join("touches.json");
+        let touches_log_file = branch_dir.join("touches.log");
         let touch_content_dir = branch_dir.join("touch-content");
         let meta_file = branch_dir.join("meta.json");
 
@@ -663,8 +669,8 @@ impl Branch {
         if !tombstones_file.exists() {
             File::create(&tombstones_file)?;
         }
-        let tombstones = Self::load_tombstones(&tombstones_file)?;
-        let touches = Self::load_touches(&touches_file)?;
+        let tombstones = Self::load_tombstones(&tombstones_file, &tombstones_log_file)?;
+        let touches = Self::load_touches(&touches_file, &touches_log_file)?;
 
         Ok(Self {
             name: metadata.name,
@@ -672,7 +678,8 @@ impl Branch {
             files_dir,
             inherited_dir,
             tombstones_file,
-            touches_file,
+            tombstones_log_file,
+            touches_log_file,
             touch_content_dir,
             meta_file,
             inheritance: metadata.inheritance,
@@ -733,36 +740,84 @@ impl Branch {
         self.write_metadata()
     }
 
-    fn load_tombstones(path: &Path) -> Result<HashSet<String>> {
+    fn load_tombstones(snapshot_path: &Path, log_path: &Path) -> Result<HashSet<String>> {
         let mut set = HashSet::new();
-        if path.exists() {
-            let file = File::open(path)?;
+        if snapshot_path.exists() {
+            let file = File::open(snapshot_path)?;
             for line in BufReader::new(file).lines() {
-                set.insert(line?);
+                let line = line?;
+                if !line.trim().is_empty() {
+                    set.insert(line);
+                }
+            }
+        }
+
+        if log_path.exists() {
+            let file = File::open(log_path)?;
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(path) = line.strip_prefix("+ ") {
+                    set.insert(path.to_string());
+                } else if let Some(path) = line.strip_prefix("- ") {
+                    set.remove(path);
+                } else {
+                    // Tolerate a bare-path log line as an add for forward/backward
+                    // compatibility with simple append-only tombstone stores.
+                    set.insert(line);
+                }
             }
         }
         Ok(set)
     }
 
-    fn load_touches(path: &Path) -> Result<HashMap<String, TouchRecord>> {
-        if !path.exists() {
-            return Ok(HashMap::new());
-        }
-        let data = fs::read(path)?;
-        if data.is_empty() {
-            return Ok(HashMap::new());
-        }
-        Ok(serde_json::from_slice(&data)?)
+    fn append_tombstone_op(&self, op: char, path: &str) -> Result<()> {
+        storage::ensure_parent_dirs(&self.tombstones_log_file)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.tombstones_log_file)?;
+        writeln!(file, "{} {}", op, path)?;
+        Ok(())
     }
 
-    fn write_touches(&self, touches: &HashMap<String, TouchRecord>) -> Result<()> {
-        let data = serde_json::to_vec_pretty(touches)?;
-        storage::ensure_parent_dirs(&self.touches_file)?;
-        let tmp = self
-            .touches_file
-            .with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
-        fs::write(&tmp, data)?;
-        fs::rename(&tmp, &self.touches_file)?;
+    fn load_touches(snapshot_path: &Path, log_path: &Path) -> Result<HashMap<String, TouchRecord>> {
+        let mut touches = if !snapshot_path.exists() {
+            HashMap::new()
+        } else {
+            let data = fs::read(snapshot_path)?;
+            if data.is_empty() {
+                HashMap::new()
+            } else {
+                serde_json::from_slice(&data)?
+            }
+        };
+
+        if log_path.exists() {
+            let file = File::open(log_path)?;
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: TouchRecord = serde_json::from_str(&line)?;
+                touches.insert(record.path.clone(), record);
+            }
+        }
+
+        Ok(touches)
+    }
+
+    fn append_touch(&self, record: &TouchRecord) -> Result<()> {
+        storage::ensure_parent_dirs(&self.touches_log_file)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.touches_log_file)?;
+        serde_json::to_writer(&mut file, record)?;
+        writeln!(file)?;
         Ok(())
     }
 
@@ -774,7 +829,12 @@ impl Branch {
         self.touches.read().get(rel_path).cloned()
     }
 
-    pub fn record_first_touch(&self, rel_path: &str, inherited: Option<&Path>) -> Result<()> {
+    pub fn record_first_touch(
+        &self,
+        rel_path: &str,
+        inherited: Option<&Path>,
+        capture_base_content: bool,
+    ) -> Result<()> {
         let mut touches = self.touches.write();
         if touches.contains_key(rel_path) {
             return Ok(());
@@ -782,25 +842,25 @@ impl Branch {
 
         let base_identity = PathIdentity::from_path(inherited);
         let mut base_content_key = None;
-        if let Some(path) = inherited {
-            if let Some(bytes) = read_bounded_text(path)? {
-                let key = touch_content_key(rel_path);
-                let content_path = self.touch_content_path(&key);
-                storage::ensure_parent_dirs(&content_path)?;
-                fs::write(&content_path, bytes)?;
-                base_content_key = Some(key);
+        if capture_base_content {
+            if let Some(path) = inherited {
+                if let Some(bytes) = read_bounded_text(path)? {
+                    let key = touch_content_key(rel_path);
+                    let content_path = self.touch_content_path(&key);
+                    storage::ensure_parent_dirs(&content_path)?;
+                    fs::write(&content_path, bytes)?;
+                    base_content_key = Some(key);
+                }
             }
         }
 
-        touches.insert(
-            rel_path.to_string(),
-            TouchRecord {
-                path: rel_path.to_string(),
-                base_at_first_touch: base_identity,
-                base_content_key,
-            },
-        );
-        self.write_touches(&touches)
+        let record = TouchRecord {
+            path: rel_path.to_string(),
+            base_at_first_touch: base_identity,
+            base_content_key,
+        };
+        touches.insert(rel_path.to_string(), record.clone());
+        self.append_touch(&record)
     }
 
     pub fn read_touch_base_content(&self, record: &TouchRecord) -> Result<Option<Vec<u8>>> {
@@ -841,10 +901,7 @@ impl Branch {
     pub fn add_tombstone(&self, path: &str) -> Result<()> {
         let mut tombstones = self.tombstones.write();
         if tombstones.insert(path.to_string()) {
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&self.tombstones_file)?;
-            writeln!(file, "{}", path)?;
+            self.append_tombstone_op('+', path)?;
         }
         Ok(())
     }
@@ -852,19 +909,23 @@ impl Branch {
     pub fn remove_tombstone(&self, path: &str) -> Result<()> {
         let mut tombstones = self.tombstones.write();
         if tombstones.remove(path) {
-            // The tombstones file is a set, not an operation log.  Leaving a
-            // removed tombstone on disk until a later compaction makes daemon
-            // reloads resurrect stale deletes, so persist removals immediately.
-            self.rewrite_tombstones(&tombstones)?;
+            self.append_tombstone_op('-', path)?;
         }
         Ok(())
     }
 
-    /// Rewrite the tombstones file from the in-memory set (caller holds write lock).
+    /// Rewrite the tombstones snapshot from the in-memory set and clear the
+    /// incremental log. This is used by commit/compaction-style paths, not by
+    /// the per-file delete/write hot path.
     fn rewrite_tombstones(&self, tombstones: &HashSet<String>) -> Result<()> {
         let mut file = File::create(&self.tombstones_file)?;
         for t in tombstones {
             writeln!(file, "{}", t)?;
+        }
+        match fs::remove_file(&self.tombstones_log_file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         Ok(())
     }
@@ -1454,18 +1515,27 @@ impl BranchManager {
         self.inherited_path_exists_locked(&branches, branch, rel_path)
     }
 
-    fn record_first_touch_locked(
+    fn resolve_inherited_for_touch_locked(
         &self,
         branches: &HashMap<String, Branch>,
         branch: &Branch,
         rel_path: &str,
-    ) -> Result<()> {
-        let inherited = if branch.is_hidden(rel_path) {
-            None
+    ) -> Result<Option<PathBuf>> {
+        if branch.is_hidden(rel_path) {
+            Ok(None)
         } else {
-            self.inherited_resolve_path_locked(branches, branch, rel_path)?
-        };
-        branch.record_first_touch(rel_path, inherited.as_deref())
+            self.inherited_resolve_path_locked(branches, branch, rel_path)
+        }
+    }
+
+    fn record_first_touch_locked(
+        &self,
+        branch: &Branch,
+        rel_path: &str,
+        inherited: Option<&Path>,
+        capture_base_content: bool,
+    ) -> Result<()> {
+        branch.record_first_touch(rel_path, inherited, capture_base_content)
     }
 
     pub fn ensure_delta_path_for_write(
@@ -1487,8 +1557,9 @@ impl BranchManager {
 
         let delta = branch.delta_path(rel_path);
         if delta.symlink_metadata().is_err() {
-            self.record_first_touch_locked(&branches, branch, rel_path)?;
-            if let Some(src) = self.inherited_resolve_path_locked(&branches, branch, rel_path)? {
+            let inherited = self.resolve_inherited_for_touch_locked(&branches, branch, rel_path)?;
+            self.record_first_touch_locked(branch, rel_path, inherited.as_deref(), true)?;
+            if let Some(src) = inherited {
                 if let Ok(meta) = src.symlink_metadata() {
                     if meta.file_type().is_symlink() || meta.file_type().is_file() {
                         let src_size = meta.len();
@@ -1532,8 +1603,9 @@ impl BranchManager {
             .get(branch_name)
             .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
-        self.record_first_touch_locked(&branches, branch, rel_path)?;
-        let inherited_exists = self.inherited_path_exists_locked(&branches, branch, rel_path)?;
+        let inherited = self.resolve_inherited_for_touch_locked(&branches, branch, rel_path)?;
+        self.record_first_touch_locked(branch, rel_path, inherited.as_deref(), false)?;
+        let inherited_exists = inherited.is_some();
         let delta = branch.delta_path(rel_path);
         if let Ok(meta) = delta.symlink_metadata() {
             let freed = if meta.file_type().is_dir() {
@@ -2094,6 +2166,184 @@ mod branch_manager_tests {
     fn write_delta(mgr: &BranchManager, branch: &str, rel_path: &str, data: &[u8]) {
         let delta = mgr.ensure_delta_path_for_write(branch, rel_path).unwrap();
         write(&delta, data);
+    }
+
+    #[test]
+    fn first_touch_appends_incrementally_without_rewriting_legacy_snapshot() {
+        let tmp = TmpDir::new();
+        let base = tmp.path().join("base");
+        let storage = tmp.path().join("storage");
+        let work = tmp.path().join("work");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&work).unwrap();
+
+        let mgr = BranchManager::new(storage.clone(), base.clone(), work.clone(), None).unwrap();
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        drop(mgr);
+
+        // Simulate an existing large legacy touches.json snapshot from an old
+        // session. Recording one more first-touch must not rewrite this file:
+        // on NFS-backed CCC stores, repeatedly rewriting multi-MB JSON made
+        // deleting even an empty old .scratch/.ccc-storage directory take
+        // seconds.
+        let touches_file = storage.join("branches/work/touches.json");
+        let legacy_snapshot = serde_json::json!({
+            "/already-touched": {
+                "path": "/already-touched",
+                "base_at_first_touch": {
+                    "exists": false,
+                    "kind": "missing",
+                    "bytes": 0,
+                    "mtime_ns": null
+                }
+            }
+        });
+        fs::write(
+            &touches_file,
+            serde_json::to_vec_pretty(&legacy_snapshot).unwrap(),
+        )
+        .unwrap();
+        let before = fs::read(&touches_file).unwrap();
+
+        fs::create_dir_all(base.join("empty-old-scratch/.ccc-storage")).unwrap();
+        let mgr = BranchManager::new(storage.clone(), base, work, None).unwrap();
+        mgr.delete_path_in_branch("work", "/empty-old-scratch")
+            .unwrap();
+
+        assert_eq!(
+            fs::read(&touches_file).unwrap(),
+            before,
+            "recording an additional first-touch should append to touches.log, not rewrite touches.json"
+        );
+
+        let touches_log = storage.join("branches/work/touches.log");
+        let log = fs::read_to_string(&touches_log).expect("touches.log should be appended");
+        assert!(
+            log.contains("/empty-old-scratch"),
+            "incremental touch log should contain the newly deleted directory"
+        );
+
+        let reloaded = BranchManager::new(
+            storage,
+            tmp.path().join("base"),
+            tmp.path().join("work"),
+            None,
+        )
+        .unwrap();
+        let branches = reloaded.branches.read();
+        let branch = branches.get("work").unwrap();
+        assert!(
+            branch.get_touch_record("/already-touched").is_some(),
+            "legacy snapshot touch should still load"
+        );
+        assert!(
+            branch.get_touch_record("/empty-old-scratch").is_some(),
+            "incremental log touch should load on daemon restart"
+        );
+    }
+
+    #[test]
+    fn tombstone_removal_appends_incrementally_without_rewriting_legacy_snapshot() {
+        let tmp = TmpDir::new();
+        let base = tmp.path().join("base");
+        let storage = tmp.path().join("storage");
+        let work = tmp.path().join("work");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&work).unwrap();
+
+        let mgr = BranchManager::new(storage.clone(), base.clone(), work.clone(), None).unwrap();
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        drop(mgr);
+
+        let tombstones_file = storage.join("branches/work/tombstones");
+        fs::write(
+            &tombstones_file,
+            "/old-empty-scratch\n/old-empty-scratch/.ccc-storage\n",
+        )
+        .unwrap();
+        let before = fs::read(&tombstones_file).unwrap();
+
+        let mgr = BranchManager::new(storage.clone(), base, work, None).unwrap();
+        // The inherited path is gone, so this delete is effectively clearing
+        // stale BranchFS overlay state. It must not rewrite a huge tombstones
+        // snapshot just to remove one stale path.
+        mgr.delete_path_in_branch("work", "/old-empty-scratch")
+            .unwrap();
+
+        assert_eq!(
+            fs::read(&tombstones_file).unwrap(),
+            before,
+            "removing one stale tombstone should append to tombstones.log, not rewrite tombstones"
+        );
+
+        let tombstones_log = storage.join("branches/work/tombstones.log");
+        let log = fs::read_to_string(&tombstones_log).expect("tombstones.log should be appended");
+        assert!(
+            log.contains("- /old-empty-scratch"),
+            "incremental tombstone log should record the removal"
+        );
+
+        let reloaded = BranchManager::new(
+            storage,
+            tmp.path().join("base"),
+            tmp.path().join("work"),
+            None,
+        )
+        .unwrap();
+        let branches = reloaded.branches.read();
+        let branch = branches.get("work").unwrap();
+        assert!(
+            !branch.is_deleted("/old-empty-scratch"),
+            "incremental tombstone removal should load on daemon restart"
+        );
+        assert!(
+            branch.is_deleted("/old-empty-scratch/.ccc-storage"),
+            "unrelated descendant tombstone should remain"
+        );
+    }
+
+    #[test]
+    fn delete_first_touch_does_not_copy_inherited_text_content() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/file.txt"), b"base text\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        mgr.delete_path_in_branch("work", "/file.txt").unwrap();
+
+        let branches = mgr.branches.read();
+        let branch = branches.get("work").unwrap();
+        let record = branch
+            .get_touch_record("/file.txt")
+            .expect("delete should record first touch identity");
+        assert!(
+            record.base_content_key.is_none(),
+            "delete touches should not read/copy inherited text contents"
+        );
+    }
+
+    #[test]
+    fn write_first_touch_keeps_inherited_text_content_for_merge() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/file.txt"), b"base text\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        write_delta(&mgr, "work", "/file.txt", b"changed\n");
+
+        let branches = mgr.branches.read();
+        let branch = branches.get("work").unwrap();
+        let record = branch
+            .get_touch_record("/file.txt")
+            .expect("write should record first touch identity");
+        assert!(
+            record.base_content_key.is_some(),
+            "write touches should keep inherited text contents for 3-way merge"
+        );
     }
 
     #[test]

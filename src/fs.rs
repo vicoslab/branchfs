@@ -4,14 +4,14 @@ use std::fs::File;
 use std::io::{Read as IoRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl,
     ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::branch::BranchManager;
 use crate::error::BranchError;
@@ -28,6 +28,10 @@ pub(crate) const BLOCK_SIZE: u32 = 512;
 
 pub(crate) const CTL_FILE: &str = ".branchfs_ctl";
 pub(crate) const CTL_INO: u64 = u64::MAX - 1;
+
+type BlockingJob = Box<dyn FnOnce() + Send + 'static>;
+const BLOCKING_WORKERS: usize = 1;
+static BLOCKING_WORK_QUEUE: OnceLock<mpsc::Sender<BlockingJob>> = OnceLock::new();
 
 /// Cached open file descriptor for the most recently read inode.
 /// Eliminates per-read resolve_path() (2-3 stat syscalls on non-existent
@@ -113,7 +117,7 @@ impl WriteFileCache {
 
 pub struct BranchFs {
     pub(crate) manager: Arc<BranchManager>,
-    pub(crate) inodes: InodeManager,
+    pub(crate) inodes: Arc<InodeManager>,
     pub(crate) mountpoint: PathBuf,
     pub(crate) current_epoch: AtomicU64,
     /// Per-branch ctl inode numbers: branch_name → ino
@@ -147,7 +151,7 @@ impl BranchFs {
         let current_epoch = manager.get_epoch();
         Self {
             manager,
-            inodes: InodeManager::new(),
+            inodes: Arc::new(InodeManager::new()),
             mountpoint,
             current_epoch: AtomicU64::new(current_epoch),
             branch_ctl_inodes: RwLock::new(HashMap::new()),
@@ -172,6 +176,80 @@ impl BranchFs {
 
     pub(crate) fn branch_writable(&self, branch: &str) -> bool {
         self.manager.is_branch_writable(branch)
+    }
+
+    fn blocking_work_queue() -> &'static mpsc::Sender<BlockingJob> {
+        BLOCKING_WORK_QUEUE.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<BlockingJob>();
+            let rx = Arc::new(Mutex::new(rx));
+            for idx in 0..BLOCKING_WORKERS {
+                let rx = rx.clone();
+                let _ = std::thread::Builder::new()
+                    .name(format!("branchfs-blocking-{}", idx))
+                    .spawn(move || loop {
+                        let job = rx.lock().recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => break,
+                        }
+                    });
+            }
+            tx
+        })
+    }
+
+    pub(crate) fn spawn_blocking_work<F>(_name: &'static str, work: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let job: BlockingJob = Box::new(work);
+        if let Err(err) = Self::blocking_work_queue().send(job) {
+            (err.0)();
+        }
+    }
+
+    fn reply_from_delete_result(
+        manager: &BranchManager,
+        branch: &str,
+        inode_path: &str,
+        inodes: &InodeManager,
+        reply: ReplyEmpty,
+        result: crate::Result<()>,
+        stale_errno: Option<i32>,
+    ) {
+        match result {
+            Ok(()) if stale_errno.is_some() && !manager.is_branch_valid(branch) => {
+                reply.error(stale_errno.unwrap())
+            }
+            Ok(()) => {
+                inodes.remove(inode_path);
+                reply.ok();
+            }
+            Err(_) => reply.error(stale_errno.unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn delete_path_async(
+        manager: Arc<BranchManager>,
+        inodes: Arc<InodeManager>,
+        branch: String,
+        rel_path: String,
+        inode_path: String,
+        stale_errno: Option<i32>,
+        reply: ReplyEmpty,
+    ) {
+        Self::spawn_blocking_work("branchfs-delete", move || {
+            let result = manager.delete_path_in_branch(&branch, &rel_path);
+            Self::reply_from_delete_result(
+                &manager,
+                &branch,
+                &inode_path,
+                &inodes,
+                reply,
+                result,
+                stale_errno,
+            );
+        });
     }
 
     pub(crate) fn write_denied_error(&self, branch: &str) -> Option<i32> {
@@ -1171,16 +1249,16 @@ impl Filesystem for BranchFs {
                 format!("{}/{}", parent_rel, name_str)
             };
 
-            let result = self.manager.delete_path_in_branch(&branch, &rel_path);
-
-            if result.is_err() {
-                reply.error(libc::EIO);
-                return;
-            }
-
             let inode_path = format!("/@{}{}", branch, rel_path);
-            self.inodes.remove(&inode_path);
-            reply.ok();
+            Self::delete_path_async(
+                self.manager.clone(),
+                self.inodes.clone(),
+                branch,
+                rel_path,
+                inode_path,
+                None,
+                reply,
+            );
         } else {
             // Root-path unlink (or EPERM for ctl files)
             match classify_path(&parent_path) {
@@ -1199,15 +1277,15 @@ impl Filesystem for BranchFs {
                         reply.error(errno);
                         return;
                     }
-                    let result = self.manager.delete_path_in_branch(&current_branch, &path);
-
-                    if result.is_err() || self.is_stale() {
-                        reply.error(libc::ESTALE);
-                        return;
-                    }
-
-                    self.inodes.remove(&path);
-                    reply.ok();
+                    Self::delete_path_async(
+                        self.manager.clone(),
+                        self.inodes.clone(),
+                        current_branch,
+                        path.clone(),
+                        path,
+                        Some(libc::ESTALE),
+                        reply,
+                    );
                 }
                 _ => {
                     reply.error(libc::ENOENT);
@@ -2107,7 +2185,9 @@ mod tests {
     use super::*;
     use crate::branch::BranchManager;
     use std::path::PathBuf;
+    use std::sync::mpsc;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn test_manager() -> Arc<BranchManager> {
         let root = std::env::temp_dir().join(format!("branchfs-isstale-{}", uuid::Uuid::new_v4()));
@@ -2160,6 +2240,36 @@ mod tests {
             manager_epoch,
             "checking staleness should refresh the mount epoch so fd caches miss"
         );
+    }
+
+    #[test]
+    fn blocking_fuse_work_is_spawned_off_the_request_loop() {
+        // fuser 0.16 dispatches one request at a time on the session thread.
+        // Heavy deletes must therefore be moved to a worker thread and reply
+        // asynchronously; otherwise unrelated requests such as statfs/df wait
+        // behind rm -rf metadata work.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (unblock_tx, unblock_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        BranchFs::spawn_blocking_work("branchfs-test-worker", move || {
+            started_tx.send(()).unwrap();
+            unblock_rx.recv().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should start promptly");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "spawn_blocking_work must return without waiting for slow filesystem work"
+        );
+
+        unblock_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should finish after it is unblocked");
     }
 
     #[test]
