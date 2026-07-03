@@ -1801,12 +1801,19 @@ impl BranchManager {
         Ok(written)
     }
 
-    fn prune_empty_delta_parents(files_dir: &Path, start: Option<&Path>) {
+    fn prune_empty_delta_parents(branch: &Branch, start: Option<&Path>) {
         let Some(start) = start else {
             return;
         };
         let mut current = start.to_path_buf();
-        while current.starts_with(files_dir) && current != files_dir {
+        while current.starts_with(&branch.files_dir) && current != branch.files_dir {
+            let rel_path = match current.strip_prefix(&branch.files_dir) {
+                Ok(rel) => format!("/{}", rel.to_string_lossy()),
+                Err(_) => break,
+            };
+            if branch.get_touch_record(&rel_path).is_some() {
+                break;
+            }
             match fs::remove_dir(&current) {
                 Ok(()) => {
                     if let Some(parent) = current.parent() {
@@ -1839,7 +1846,7 @@ impl BranchManager {
             };
             remove_entry(&delta)?;
             self.quota.sub(freed);
-            Self::prune_empty_delta_parents(&branch.files_dir, delta.parent());
+            Self::prune_empty_delta_parents(branch, delta.parent());
         }
 
         if inherited_exists {
@@ -2208,7 +2215,7 @@ impl BranchManager {
 
             let copied_paths = staged.commit()?;
             for parent_dir in deleted_parent_delta_parents {
-                Self::prune_empty_delta_parents(&parent_files_dir, Some(&parent_dir));
+                Self::prune_empty_delta_parents(parent, Some(&parent_dir));
             }
 
             for path in &copied_paths {
@@ -2400,6 +2407,59 @@ mod branch_manager_tests {
     fn write_delta(mgr: &BranchManager, branch: &str, rel_path: &str, data: &[u8]) {
         let delta = mgr.ensure_delta_path_for_write(branch, rel_path).unwrap();
         write(&delta, data);
+    }
+
+    fn mkdir_delta(mgr: &BranchManager, branch: &str, rel_path: &str) {
+        let delta = mgr.ensure_delta_path_for_write(branch, rel_path).unwrap();
+        fs::create_dir_all(delta).unwrap();
+    }
+
+    #[test]
+    fn deleting_child_directory_keeps_explicit_empty_delta_parents() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        mkdir_delta(&mgr, "work", "/fake-nfs");
+        mkdir_delta(&mgr, "work", "/fake-nfs/nfs-session");
+        mkdir_delta(&mgr, "work", "/fake-nfs/nfs-session/.ccc-storage");
+
+        mgr.delete_path_in_branch("work", "/fake-nfs/nfs-session/.ccc-storage")
+            .unwrap();
+
+        assert!(
+            tmp.path()
+                .join("storage/branches/work/files/fake-nfs/nfs-session")
+                .is_dir(),
+            "deleting the child directory must not prune its explicitly created parent"
+        );
+        assert!(
+            mgr.resolve_path("work", "/fake-nfs/nfs-session")
+                .unwrap()
+                .is_some(),
+            "explicit empty parent should remain visible in the branch view"
+        );
+    }
+
+    #[test]
+    fn deleting_file_still_prunes_untouched_structural_delta_parents() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        write_delta(&mgr, "work", "/structural/only/file.txt", b"payload");
+
+        mgr.delete_path_in_branch("work", "/structural/only/file.txt")
+            .unwrap();
+
+        assert!(
+            !tmp.path()
+                .join("storage/branches/work/files/structural")
+                .exists(),
+            "purely structural delta parent dirs should still be cleaned up"
+        );
     }
 
     #[test]
