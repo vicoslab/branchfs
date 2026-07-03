@@ -269,9 +269,10 @@ Committing merges a **leaf branch** into its immediate parent:
 1. Only leaf branches can be committed, attempting to commit a branch with children returns an error
 2. If the parent is **main**: tombstone deletions are applied to the base filesystem, then delta files are copied to base
 3. If the parent is **another branch**: child's delta files are merged into the parent's delta directory, and tombstones are merged (child tombstones shadow parent deltas, child deltas un-tombstone parent tombstones)
-4. The committed branch is removed; epoch increments
-5. **Mount automatically switches to the parent branch** (stays mounted)
-6. Memory-mapped regions trigger `SIGBUS` on next access
+4. A tombstone is preserved only when it hides an inherited path in the parent/base view. If the child deletes a path that exists only as the parent branch's delta, commit removes that parent delta and does **not** add a parent tombstone; create-then-delete is a no-op, not a durable delete.
+5. The committed branch is removed; epoch increments
+6. **Mount automatically switches to the parent branch** (stays mounted)
+7. Memory-mapped regions trigger `SIGBUS` on next access
 
 ### Abort
 
