@@ -225,7 +225,10 @@ impl BranchFs {
                 inodes.remove(inode_path);
                 reply.ok();
             }
-            Err(_) => reply.error(stale_errno.unwrap_or(libc::EIO)),
+            Err(_) if stale_errno.is_some() && !manager.is_branch_valid(branch) => {
+                reply.error(stale_errno.unwrap())
+            }
+            Err(e) => reply.error(Self::branch_error_errno(&e)),
         }
     }
 
@@ -240,6 +243,29 @@ impl BranchFs {
     ) {
         Self::spawn_blocking_work("branchfs-delete", move || {
             let result = manager.delete_path_in_branch(&branch, &rel_path);
+            Self::reply_from_delete_result(
+                &manager,
+                &branch,
+                &inode_path,
+                &inodes,
+                reply,
+                result,
+                stale_errno,
+            );
+        });
+    }
+
+    fn rmdir_path_async(
+        manager: Arc<BranchManager>,
+        inodes: Arc<InodeManager>,
+        branch: String,
+        rel_path: String,
+        inode_path: String,
+        stale_errno: Option<i32>,
+        reply: ReplyEmpty,
+    ) {
+        Self::spawn_blocking_work("branchfs-rmdir", move || {
+            let result = manager.rmdir_path_in_branch(&branch, &rel_path);
             Self::reply_from_delete_result(
                 &manager,
                 &branch,
@@ -1349,7 +1375,85 @@ impl Filesystem for BranchFs {
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        self.unlink(_req, parent, name, reply);
+        let parent_path = match self.inodes.get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let name_str = name.to_string_lossy();
+
+        let branch_ctx = match classify_path(&parent_path) {
+            PathContext::BranchDir(b) => Some((b, "/".to_string())),
+            PathContext::BranchPath(b, rel) => Some((b, rel)),
+            _ => None,
+        };
+
+        if let Some((branch, parent_rel)) = branch_ctx {
+            if name_str.starts_with('@') || *name_str == *CTL_FILE {
+                reply.error(libc::EPERM);
+                return;
+            }
+
+            if !self.manager.is_branch_valid(&branch) {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            if let Some(errno) = self.write_denied_error(&branch) {
+                reply.error(errno);
+                return;
+            }
+
+            let rel_path = if parent_rel == "/" {
+                format!("/{}", name_str)
+            } else {
+                format!("{}/{}", parent_rel, name_str)
+            };
+
+            let inode_path = format!("/@{}{}", branch, rel_path);
+            Self::rmdir_path_async(
+                self.manager.clone(),
+                self.inodes.clone(),
+                branch,
+                rel_path,
+                inode_path,
+                None,
+                reply,
+            );
+        } else {
+            match classify_path(&parent_path) {
+                PathContext::BranchCtl(_) | PathContext::RootCtl => {
+                    reply.error(libc::EPERM);
+                }
+                PathContext::RootPath(rp) => {
+                    let path = if rp == "/" {
+                        format!("/{}", name_str)
+                    } else {
+                        format!("{}/{}", rp, name_str)
+                    };
+
+                    let current_branch = self.get_branch_name();
+                    if let Some(errno) = self.write_denied_error(&current_branch) {
+                        reply.error(errno);
+                        return;
+                    }
+                    Self::rmdir_path_async(
+                        self.manager.clone(),
+                        self.inodes.clone(),
+                        current_branch,
+                        path.clone(),
+                        path,
+                        Some(libc::ESTALE),
+                        reply,
+                    );
+                }
+                _ => {
+                    reply.error(libc::ENOENT);
+                }
+            }
+        }
     }
 
     fn rename(

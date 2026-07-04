@@ -91,6 +91,10 @@ impl StorageQuota {
     }
 }
 
+fn errno_error(errno: i32) -> BranchError {
+    BranchError::Io(std::io::Error::from_raw_os_error(errno))
+}
+
 /// Remove a file or directory at `path`, following symlinks for the type check.
 /// Returns `Ok(())` even if the path doesn't exist; propagates real I/O errors.
 fn remove_entry(path: &Path) -> std::io::Result<()> {
@@ -1857,6 +1861,50 @@ impl BranchManager {
         Ok(())
     }
 
+    pub fn rmdir_path_in_branch(&self, branch_name: &str, rel_path: &str) -> Result<()> {
+        let _path_guard = self.path_lock(branch_name, rel_path).lock();
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+
+        let resolved = self
+            .resolve_path_locked(&branches, branch_name, rel_path)?
+            .ok_or_else(|| errno_error(libc::ENOENT))?;
+        let meta = resolved.symlink_metadata()?;
+        if !meta.file_type().is_dir() {
+            return Err(errno_error(libc::ENOTDIR));
+        }
+        if !self
+            .collect_dir_names_locked(&branches, branch_name, rel_path)?
+            .is_empty()
+        {
+            return Err(errno_error(libc::ENOTEMPTY));
+        }
+
+        let inherited = self.resolve_inherited_for_touch_locked(&branches, branch, rel_path)?;
+        self.record_first_touch_locked(branch, rel_path, inherited.as_deref(), false)?;
+        let inherited_exists = inherited.is_some();
+        let delta = branch.delta_path(rel_path);
+        if let Ok(meta) = delta.symlink_metadata() {
+            let freed = if meta.file_type().is_dir() {
+                StorageQuota::dir_size(&delta)
+            } else {
+                meta.len()
+            };
+            remove_entry(&delta)?;
+            self.quota.sub(freed);
+            Self::prune_empty_delta_parents(branch, delta.parent());
+        }
+
+        if inherited_exists {
+            branch.add_tombstone(rel_path)?;
+        } else {
+            branch.remove_tombstone(rel_path)?;
+        }
+        Ok(())
+    }
+
     pub fn is_branch_writable(&self, branch_name: &str) -> bool {
         self.branches
             .read()
@@ -2459,6 +2507,54 @@ mod branch_manager_tests {
                 .join("storage/branches/work/files/structural")
                 .exists(),
             "purely structural delta parent dirs should still be cleaned up"
+        );
+    }
+
+    #[test]
+    fn rmdir_refuses_non_empty_inherited_directory_without_hiding_it() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(
+            &tmp.path()
+                .join("base/.scratch/fake-nfs/nfs-session/.ccc-storage/events/log"),
+            b"event\n",
+        );
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        let result = mgr.rmdir_path_in_branch("work", "/.scratch/fake-nfs");
+
+        assert!(result.is_err(), "rmdir of a non-empty directory must fail");
+        assert!(
+            mgr.resolve_path("work", "/.scratch/fake-nfs")
+                .unwrap()
+                .is_some(),
+            "failed rmdir must not tombstone or hide the directory being traversed"
+        );
+        assert!(
+            mgr.collect_dir_names("work", "/.scratch/fake-nfs")
+                .unwrap()
+                .contains("nfs-session"),
+            "failed rmdir must leave inherited children visible"
+        );
+    }
+
+    #[test]
+    fn rmdir_removes_empty_inherited_directory_after_children_are_deleted() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        fs::create_dir_all(tmp.path().join("base/.scratch/fake-nfs/nfs-session")).unwrap();
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        mgr.rmdir_path_in_branch("work", "/.scratch/fake-nfs/nfs-session")
+            .unwrap();
+
+        assert!(
+            mgr.resolve_path("work", "/.scratch/fake-nfs/nfs-session")
+                .unwrap()
+                .is_none(),
+            "empty inherited directory should be tombstoned after rmdir"
         );
     }
 
