@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
@@ -207,6 +207,39 @@ fn invalid_offset() -> BranchError {
 
 fn file_too_large() -> BranchError {
     BranchError::Io(std::io::Error::from_raw_os_error(libc::EFBIG))
+}
+
+fn normalize_branch_rel_path(path: &str) -> Result<String> {
+    if path.is_empty() || path.contains('\0') {
+        return Err(BranchError::Invalid(
+            "path cannot be empty or contain null bytes".into(),
+        ));
+    }
+
+    let mut parts = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(BranchError::Invalid(format!(
+                    "path must stay inside the branch: {}",
+                    path
+                )));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return Err(BranchError::Invalid("cannot revert the branch root".into()));
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn path_is_same_or_descendant(candidate: &str, parent: &str) -> bool {
+    let candidate = candidate.trim_matches('/');
+    let parent = parent.trim_matches('/');
+    candidate == parent || candidate.starts_with(&format!("{}/", parent))
 }
 
 fn write_data_to_file(path: &Path, offset: u64, data: &[u8]) -> Result<u32> {
@@ -898,7 +931,7 @@ impl Branch {
     }
 
     fn load_touches(snapshot_path: &Path, log_path: &Path) -> Result<HashMap<String, TouchRecord>> {
-        let mut touches = if !snapshot_path.exists() {
+        let mut touches: HashMap<String, TouchRecord> = if !snapshot_path.exists() {
             HashMap::new()
         } else {
             let data = fs::read(snapshot_path)?;
@@ -914,6 +947,10 @@ impl Branch {
             for line in BufReader::new(file).lines() {
                 let line = line?;
                 if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(path) = line.strip_prefix("- ") {
+                    touches.retain(|candidate, _| !path_is_same_or_descendant(candidate, path));
                     continue;
                 }
                 let record: TouchRecord = serde_json::from_str(&line)?;
@@ -932,6 +969,47 @@ impl Branch {
             .open(&self.touches_log_file)?;
         serde_json::to_writer(&mut file, record)?;
         writeln!(file)?;
+        Ok(())
+    }
+
+    fn append_touch_removal(&self, rel_path: &str) -> Result<()> {
+        storage::ensure_parent_dirs(&self.touches_log_file)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.touches_log_file)?;
+        writeln!(file, "- {}", rel_path)?;
+        Ok(())
+    }
+
+    fn remove_touch_records_under(&self, rel_path: &str) -> Result<()> {
+        let removed = {
+            let mut touches = self.touches.write();
+            let removed: Vec<_> = touches
+                .iter()
+                .filter(|(path, _)| path_is_same_or_descendant(path, rel_path))
+                .map(|(_, record)| record.clone())
+                .collect();
+            for record in &removed {
+                touches.remove(&record.path);
+            }
+            removed
+        };
+
+        if removed.is_empty() {
+            return Ok(());
+        }
+
+        self.append_touch_removal(rel_path)?;
+        for record in removed {
+            if let Some(key) = record.base_content_key {
+                match fs::remove_file(self.touch_content_path(&key)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1024,6 +1102,26 @@ impl Branch {
         let mut tombstones = self.tombstones.write();
         if tombstones.remove(path) {
             self.append_tombstone_op('-', path)?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_tombstones_under(&self, path: &str) -> Result<()> {
+        let removed = {
+            let mut tombstones = self.tombstones.write();
+            let removed: Vec<_> = tombstones
+                .iter()
+                .filter(|candidate| path_is_same_or_descendant(candidate, path))
+                .cloned()
+                .collect();
+            for tombstone in &removed {
+                tombstones.remove(tombstone);
+            }
+            removed
+        };
+
+        for tombstone in removed {
+            self.append_tombstone_op('-', &tombstone)?;
         }
         Ok(())
     }
@@ -1902,6 +2000,41 @@ impl BranchManager {
         } else {
             branch.remove_tombstone(rel_path)?;
         }
+        Ok(())
+    }
+
+    pub fn revert_path_in_branch(&self, branch_name: &str, rel_path: &str) -> Result<()> {
+        let rel_path = normalize_branch_rel_path(rel_path)?;
+        let _path_guard = self.path_lock(branch_name, &rel_path).lock();
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+
+        if !branch.is_writable() {
+            return Err(BranchError::Invalid(format!(
+                "branch '{}' is frozen/read-only",
+                branch_name
+            )));
+        }
+
+        let delta = branch.delta_path(&rel_path);
+        if let Ok(meta) = delta.symlink_metadata() {
+            let freed = if meta.file_type().is_dir() {
+                StorageQuota::dir_size(&delta)
+            } else {
+                meta.len()
+            };
+            remove_entry(&delta)?;
+            self.quota.sub(freed);
+            Self::prune_empty_delta_parents(branch, delta.parent());
+        }
+        branch.remove_tombstones_under(&rel_path)?;
+        branch.remove_touch_records_under(&rel_path)?;
+
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        drop(branches);
+        self.invalidate_branches(&[branch_name.to_string()]);
         Ok(())
     }
 
@@ -3078,6 +3211,93 @@ mod branch_manager_tests {
             "stale tombstone came back after reload: {:?}",
             status.diff
         );
+    }
+
+    #[test]
+    fn revert_path_drops_added_file_delta() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        write_delta(&mgr, "work", "/scratch/current_date.txt", b"2026-07-07\n");
+
+        mgr.revert_path_in_branch("work", "/scratch/current_date.txt")
+            .unwrap();
+
+        assert!(
+            mgr.resolve_path("work", "/scratch/current_date.txt")
+                .unwrap()
+                .is_none(),
+            "added branch-only file should disappear after revert"
+        );
+        assert!(
+            mgr.branch_status("work").unwrap().diff.is_empty(),
+            "reverted added file should not remain in status"
+        );
+    }
+
+    #[test]
+    fn revert_path_restores_inherited_file_after_modification() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/config.txt"), b"base\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.write_data_to_branch("work", "/config.txt", 0, b"branch\n")
+            .unwrap();
+
+        mgr.revert_path_in_branch("work", "/config.txt").unwrap();
+
+        let resolved = mgr.resolve_path("work", "/config.txt").unwrap().unwrap();
+        assert_eq!(fs::read(resolved).unwrap(), b"base\n");
+        assert!(mgr.branch_status("work").unwrap().diff.is_empty());
+        let branches = mgr.branches.read();
+        let branch = branches.get("work").unwrap();
+        assert!(
+            branch.get_touch_record("/config.txt").is_none(),
+            "discarded changes should not leave stale first-touch records"
+        );
+    }
+
+    #[test]
+    fn revert_path_removes_tombstone_and_restores_inherited_file() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/old.txt"), b"old\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.delete_path_in_branch("work", "/old.txt").unwrap();
+        assert!(mgr.resolve_path("work", "/old.txt").unwrap().is_none());
+
+        mgr.revert_path_in_branch("work", "/old.txt").unwrap();
+
+        let resolved = mgr.resolve_path("work", "/old.txt").unwrap().unwrap();
+        assert_eq!(fs::read(resolved).unwrap(), b"old\n");
+        assert!(mgr.branch_status("work").unwrap().diff.is_empty());
+    }
+
+    #[test]
+    fn revert_path_drops_directory_tombstone_and_delta_descendants() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/dir/base.txt"), b"base\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.with_branch("work", |branch| {
+            branch.add_tombstone("/dir")?;
+            write(&branch.delta_path("/dir/new.txt"), b"new\n");
+            Ok(())
+        })
+        .unwrap();
+        assert!(mgr.resolve_path("work", "/dir/base.txt").unwrap().is_none());
+        assert!(mgr.resolve_path("work", "/dir/new.txt").unwrap().is_some());
+
+        mgr.revert_path_in_branch("work", "/dir").unwrap();
+
+        let base_child = mgr.resolve_path("work", "/dir/base.txt").unwrap().unwrap();
+        assert_eq!(fs::read(base_child).unwrap(), b"base\n");
+        assert!(mgr.resolve_path("work", "/dir/new.txt").unwrap().is_none());
+        assert!(mgr.branch_status("work").unwrap().diff.is_empty());
     }
 
     #[test]

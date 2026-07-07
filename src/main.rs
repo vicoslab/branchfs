@@ -143,6 +143,19 @@ enum Commands {
         storage: PathBuf,
     },
 
+    /// Revert/drop one path's branch delta and tombstones through the daemon
+    RevertPath {
+        /// Branch name to modify
+        branch: String,
+
+        /// Path inside the branch to revert/drop
+        path: String,
+
+        /// Storage directory
+        #[arg(long, default_value = "/var/lib/branchfs")]
+        storage: PathBuf,
+    },
+
     /// Freeze a branch read-only for stable review/commit
     Freeze {
         /// Branch name
@@ -540,6 +553,27 @@ fn main() -> Result<()> {
             )?;
             if response.ok {
                 println!("Aborted branch '{}'", branch);
+            } else {
+                eprintln!("Error: {}", response.error.unwrap_or_default());
+                process::exit(1);
+            }
+        }
+
+        Commands::RevertPath {
+            branch,
+            path,
+            storage,
+        } => {
+            let storage = storage.canonicalize()?;
+            let response = send_request(
+                &storage,
+                &Request::RevertPath {
+                    branch: branch.clone(),
+                    path: path.clone(),
+                },
+            )?;
+            if response.ok {
+                println!("Reverted '{}' in branch '{}'", path, branch);
             } else {
                 eprintln!("Error: {}", response.error.unwrap_or_default());
                 process::exit(1);

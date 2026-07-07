@@ -60,6 +60,10 @@ pub enum Request {
     AbortBranch {
         branch: String,
     },
+    RevertPath {
+        branch: String,
+        path: String,
+    },
     GetMountBranch {
         mountpoint: String,
     },
@@ -409,6 +413,12 @@ impl Daemon {
                 Ok(parent) => Response::success_with_data(serde_json::json!({ "parent": parent })),
                 Err(e) => Response::error(&format!("{}", e)),
             },
+            Request::RevertPath { branch, path } => {
+                match self.manager.revert_path_in_branch(&branch, &path) {
+                    Ok(()) => Response::success(),
+                    Err(e) => Response::error(&format!("{}", e)),
+                }
+            }
             Request::GetMountBranch { mountpoint } => {
                 let path = PathBuf::from(&mountpoint);
                 if let Some(branch) = self.manager.get_mount_branch(&path) {
