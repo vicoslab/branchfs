@@ -19,17 +19,28 @@ TESTS_FAILED=0
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRANCHFS="$PROJECT_ROOT/target/release/branchfs"
 
-# Create unique test directories for this test run
+# Create unique test directories for this test script. Each setup() call gets
+# its own base/storage/mount triple under this root because BranchFS branch
+# stores are intentionally durable across unmount/remount. Reusing one storage
+# directory for every test made branch names and uncommitted deltas leak between
+# test cases.
 TEST_ID="$$_$(date +%s)"
-TEST_BASE="/tmp/branchfs_test_base_$TEST_ID"
-TEST_STORAGE="/tmp/branchfs_test_storage_$TEST_ID"
-TEST_MNT="/tmp/branchfs_test_mnt_$TEST_ID"
+TEST_ROOT="/tmp/branchfs_test_$TEST_ID"
+TEST_SEQ=0
+TEST_BASE=""
+TEST_STORAGE=""
+TEST_MNT=""
 
 # Track if we've set up
 SETUP_DONE=0
 
 # Set up test environment
 setup() {
+    TEST_SEQ=$((TEST_SEQ + 1))
+    TEST_BASE="$TEST_ROOT/base_$TEST_SEQ"
+    TEST_STORAGE="$TEST_ROOT/storage_$TEST_SEQ"
+    TEST_MNT="$TEST_ROOT/mnt_$TEST_SEQ"
+
     # Create test directories
     mkdir -p "$TEST_BASE"
     mkdir -p "$TEST_STORAGE"
@@ -52,24 +63,24 @@ setup() {
 cleanup() {
     echo -e "${YELLOW}Cleaning up...${NC}"
 
-    # Try to unmount if mounted
-    if mountpoint -q "$TEST_MNT" 2>/dev/null; then
-        fusermount3 -u "$TEST_MNT" 2>/dev/null || fusermount -u "$TEST_MNT" 2>/dev/null || true
-        sleep 0.5
-    fi
+    # Try to unmount any per-test mount that survived a failed test.
+    for mnt in "$TEST_ROOT"/mnt_*; do
+        [[ -e "$mnt" ]] || continue
+        if mountpoint -q "$mnt" 2>/dev/null; then
+            fusermount3 -u "$mnt" 2>/dev/null || fusermount -u "$mnt" 2>/dev/null || true
+            sleep 0.5
+        fi
+    done
 
-    # Kill any daemon that might be running with our storage
-    local socket="$TEST_STORAGE/daemon.sock"
-    if [[ -S "$socket" ]]; then
-        # Send shutdown request
+    # Kill any daemon that might be running with a per-test storage directory.
+    for socket in "$TEST_ROOT"/storage_*/daemon.sock; do
+        [[ -S "$socket" ]] || continue
         echo '{"cmd":"shutdown"}' | nc -U "$socket" 2>/dev/null || true
         sleep 0.5
-    fi
+    done
 
-    # Remove test directories
-    rm -rf "$TEST_BASE" 2>/dev/null || true
-    rm -rf "$TEST_STORAGE" 2>/dev/null || true
-    rm -rf "$TEST_MNT" 2>/dev/null || true
+    # Remove all test directories for this script.
+    rm -rf "$TEST_ROOT" 2>/dev/null || true
 
     echo -e "${GREEN}Cleanup complete${NC}"
 }

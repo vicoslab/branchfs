@@ -317,6 +317,24 @@ impl BranchFs {
             || (flags & libc::O_APPEND) != 0
     }
 
+    fn effective_write_offset(
+        flags: i32,
+        requested_offset: i64,
+        visible_len: Option<u64>,
+    ) -> std::result::Result<i64, i32> {
+        if requested_offset < 0 {
+            return Err(libc::EINVAL);
+        }
+        if (flags & libc::O_APPEND) == 0 {
+            return Ok(requested_offset);
+        }
+        i64::try_from(visible_len.unwrap_or(0)).map_err(|_| libc::EFBIG)
+    }
+
+    fn file_len(path: Option<&Path>) -> Option<u64> {
+        path.and_then(|p| p.metadata().ok()).map(|m| m.len())
+    }
+
     pub(crate) fn is_stale(&self) -> bool {
         let branch_name = self.get_branch_name();
         let manager_epoch = self.manager.get_epoch();
@@ -842,7 +860,7 @@ impl Filesystem for BranchFs {
         offset: i64,
         data: &[u8],
         _write_flags: u32,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
@@ -890,20 +908,29 @@ impl Filesystem for BranchFs {
         // to the same inode (after COW is already done).
         if let Some(file) = self.write_cache.get(ino, epoch) {
             use std::io::{Seek, SeekFrom, Write};
-            // Check quota for writes that extend the file
+            // Check quota for writes that extend the file. With O_APPEND, the
+            // kernel-supplied offset is not authoritative for FUSE writes; append
+            // at the current delta EOF instead.
             let old_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-            let write_end = offset as u64 + data.len() as u64;
+            let write_offset = match Self::effective_write_offset(flags, offset, Some(old_size)) {
+                Ok(offset) => offset as u64,
+                Err(errno) => {
+                    reply.error(errno);
+                    return;
+                }
+            };
+            let write_end = write_offset + data.len() as u64;
             if write_end > old_size && self.manager.quota.check(write_end - old_size).is_err() {
                 reply.error(libc::ENOSPC);
                 return;
             }
-            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+            if file.seek(SeekFrom::Start(write_offset)).is_err() {
                 reply.error(libc::EIO);
                 return;
             }
             match file.write(data) {
                 Ok(n) => {
-                    let new_end = offset as u64 + n as u64;
+                    let new_end = write_offset + n as u64;
                     if new_end > old_size {
                         self.manager.quota.add(new_end - old_size);
                     }
@@ -923,7 +950,7 @@ impl Filesystem for BranchFs {
             }
         };
 
-        let (delta, is_root) = match classify_path(&path) {
+        let (delta, is_root, write_offset) = match classify_path(&path) {
             PathContext::BranchDir(_) | PathContext::BranchCtl(_) => {
                 reply.error(libc::EPERM);
                 return;
@@ -937,19 +964,32 @@ impl Filesystem for BranchFs {
                     reply.error(libc::ENOENT);
                     return;
                 }
+                let append_len = if (flags & libc::O_APPEND) != 0 {
+                    let visible = self.resolve_for_branch(&branch, &rel_path);
+                    Self::file_len(visible.as_deref())
+                } else {
+                    None
+                };
+                let write_offset = match Self::effective_write_offset(flags, offset, append_len) {
+                    Ok(offset) => offset,
+                    Err(errno) => {
+                        reply.error(errno);
+                        return;
+                    }
+                };
                 if !self.manager.branch_has_delta(&branch, &rel_path) {
                     Self::write_data_async(
                         self.manager.clone(),
                         branch,
                         rel_path,
-                        offset,
+                        write_offset,
                         data.to_vec(),
                         reply,
                     );
                     return;
                 }
                 match self.ensure_cow_for_branch(&branch, &rel_path) {
-                    Ok(p) => (p, false),
+                    Ok(p) => (p, false, write_offset as u64),
                     Err(e) => {
                         reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                         return;
@@ -958,19 +998,32 @@ impl Filesystem for BranchFs {
             }
             _ => {
                 let current_branch = self.get_branch_name();
+                let append_len = if (flags & libc::O_APPEND) != 0 {
+                    let visible = self.resolve_for_branch(&current_branch, &path);
+                    Self::file_len(visible.as_deref())
+                } else {
+                    None
+                };
+                let write_offset = match Self::effective_write_offset(flags, offset, append_len) {
+                    Ok(offset) => offset,
+                    Err(errno) => {
+                        reply.error(errno);
+                        return;
+                    }
+                };
                 if !self.manager.branch_has_delta(&current_branch, &path) {
                     Self::write_data_async(
                         self.manager.clone(),
                         current_branch,
                         path.clone(),
-                        offset,
+                        write_offset,
                         data.to_vec(),
                         reply,
                     );
                     return;
                 }
                 match self.ensure_cow(&path) {
-                    Ok(p) => (p, true),
+                    Ok(p) => (p, true, write_offset as u64),
                     Err(e) => {
                         reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                         return;
@@ -999,12 +1052,12 @@ impl Filesystem for BranchFs {
         if let Some(file) = self.write_cache.get(ino, epoch) {
             use std::io::{Seek, SeekFrom, Write};
             let old_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-            let write_end = offset as u64 + data.len() as u64;
+            let write_end = write_offset + data.len() as u64;
             if write_end > old_size && self.manager.quota.check(write_end - old_size).is_err() {
                 reply.error(libc::ENOSPC);
                 return;
             }
-            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+            if file.seek(SeekFrom::Start(write_offset)).is_err() {
                 reply.error(libc::EIO);
                 return;
             }
@@ -1014,7 +1067,7 @@ impl Filesystem for BranchFs {
                         reply.error(libc::ESTALE);
                         return;
                     }
-                    let new_end = offset as u64 + n as u64;
+                    let new_end = write_offset + n as u64;
                     if new_end > old_size {
                         self.manager.quota.add(new_end - old_size);
                     }
@@ -2397,6 +2450,25 @@ mod tests {
             fs.current_epoch.load(std::sync::atomic::Ordering::SeqCst),
             manager_epoch,
             "checking staleness should refresh the mount epoch so fd caches miss"
+        );
+    }
+
+    #[test]
+    fn append_writes_use_visible_file_length_as_offset() {
+        assert_eq!(
+            BranchFs::effective_write_offset(libc::O_APPEND, 0, Some(12)).unwrap(),
+            12,
+            "O_APPEND must ignore the kernel-supplied write offset and append at EOF"
+        );
+        assert_eq!(
+            BranchFs::effective_write_offset(libc::O_APPEND, 5, Some(12)).unwrap(),
+            12,
+            "O_APPEND must append even when a non-zero requested offset is supplied"
+        );
+        assert_eq!(
+            BranchFs::effective_write_offset(0, 5, Some(12)).unwrap(),
+            5,
+            "non-append writes must preserve their requested offset"
         );
     }
 

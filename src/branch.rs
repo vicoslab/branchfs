@@ -376,34 +376,24 @@ fn commit_side_path(target: &Path, tag: &str) -> PathBuf {
     target.with_file_name(name)
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InheritanceMode {
     /// Resolve inherited paths recursively from the parent/base at lookup time.
     /// Branch creation is O(1) and does not scan or copy the inherited tree.
+    #[default]
     Lazy,
     /// Preserve the legacy behavior: recursively snapshot the visible parent
     /// tree into this branch's inherited directory at branch creation time.
     Snapshot,
 }
 
-impl Default for InheritanceMode {
-    fn default() -> Self {
-        Self::Lazy
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BranchState {
+    #[default]
     Open,
     Frozen,
-}
-
-impl Default for BranchState {
-    fn default() -> Self {
-        Self::Open
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1621,7 +1611,7 @@ impl BranchManager {
             } else {
                 format!("{}/{}", rel_path.trim_end_matches('/'), name)
             };
-            if branch.is_hidden(&child_rel) {
+            if branch.is_hidden(&child_rel) || branch.is_deleted(&child_rel) {
                 continue;
             }
             names.insert(name);
@@ -2688,6 +2678,28 @@ mod branch_manager_tests {
                 .unwrap()
                 .is_none(),
             "empty inherited directory should be tombstoned after rmdir"
+        );
+    }
+
+    #[test]
+    fn rmdir_removes_inherited_directory_after_all_children_are_tombstoned() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/subdir/nested.txt"), b"nested\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        mgr.delete_path_in_branch("work", "/subdir/nested.txt")
+            .unwrap();
+
+        assert!(
+            mgr.collect_dir_names("work", "/subdir").unwrap().is_empty(),
+            "tombstoned inherited children should not keep the directory non-empty"
+        );
+        mgr.rmdir_path_in_branch("work", "/subdir").unwrap();
+        assert!(
+            mgr.resolve_path("work", "/subdir").unwrap().is_none(),
+            "inherited directory should be removed once every visible child is gone"
         );
     }
 
