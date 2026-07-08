@@ -527,14 +527,14 @@ pub struct CommitOutcome {
 const MAX_TEXT_MERGE_BYTES: u64 = 1024 * 1024;
 
 fn touch_content_key(rel_path: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(rel_path.len() * 2 + 5);
-    for &byte in rel_path.as_bytes() {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
+    // Keep filenames bounded to avoid ENAMETOOLONG for deep/long branch paths.
+    // Use a stable hash so keys survive daemon restarts.
+    let mut hash: u64 = 14695981039346656037; // FNV-1a 64-bit offset basis
+    for &b in rel_path.as_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211); // FNV-1a 64-bit prime
     }
-    out.push_str(".base");
-    out
+    format!("{:016x}.base", hash)
 }
 
 fn read_bounded_text(path: &Path) -> Result<Option<Vec<u8>>> {
