@@ -1926,6 +1926,13 @@ impl BranchManager {
             .get(branch_name)
             .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
+        if !branch.is_writable() {
+            return Err(BranchError::Invalid(format!(
+                "branch '{}' is frozen/read-only",
+                branch_name
+            )));
+        }
+
         let inherited = self.resolve_inherited_for_touch_locked(&branches, branch, rel_path)?;
         self.record_first_touch_locked(branch, rel_path, inherited.as_deref(), false)?;
         let inherited_exists = inherited.is_some();
