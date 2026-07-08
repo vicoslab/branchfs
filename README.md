@@ -75,15 +75,45 @@ BranchFS supports macOS via **macFUSE**.
 4. **FUSE ABI**: On macOS, BranchFS targets FUSE ABI 7.31 for maximum compatibility and to resolve path resolution issues.
 5. **Advanced Features**: Linux-specific features like FUSE passthrough and `RENAME_EXCHANGE` are currently disabled on macOS.
 
+## Installing release binaries
+
+Tagged releases on `https://github.com/vicoslab/branchfs` build GitHub release
+assets automatically. For CCC/`ccc-agent` the important Linux asset is the
+Python wheel:
+
+```text
+vicoslab_branchfs_bin-<version>-py3-none-linux_x86_64.whl
+```
+
+That wheel contains the vicoslab `branchfs` executable and a small Python wrapper
+package (`vicoslab-branchfs-bin`). It deliberately does **not** bundle
+`libfuse3`; install the runtime library separately, for example:
+
+```bash
+sudo apt install libfuse3-3 fuse3
+```
+
+`ccc-agent[branchfs]` depends on this wheel directly from the vicoslab BranchFS
+GitHub release, so normal `ccc-agent` installs do not require Cargo/Rust.
+
 ## Building
 
 ```bash
-git clone https://github.com/user/branchfs.git
+git clone https://github.com/vicoslab/branchfs.git
 cd branchfs
 cargo build --release
 ```
 
 The binary is located at `target/release/branchfs`.
+
+To build the same Python binary wheel locally after building the Rust binary:
+
+```bash
+python3 -m pip install build wheel
+BRANCHFS_BIN_VERSION=$(grep '^version' Cargo.toml | cut -d'"' -f2) \
+BRANCHFS_BIN_BINARY="$PWD/target/release/branchfs" \
+  bash -c 'cd python/branchfs-bin && python3 -m build --wheel'
+```
 
 ## Usage Examples
 

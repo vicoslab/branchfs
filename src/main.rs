@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use branchfs::daemon::{self, Request, Response};
 
 #[derive(Parser)]
-#[command(name = "branchfs")]
+#[command(name = "branchfs", version)]
 #[command(about = "FUSE filesystem with atomic branching")]
 struct Cli {
     #[command(subcommand)]
