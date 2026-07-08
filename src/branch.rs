@@ -1963,6 +1963,13 @@ impl BranchManager {
             .get(branch_name)
             .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
+        if !branch.is_writable() {
+            return Err(BranchError::Invalid(format!(
+                "branch '{}' is frozen/read-only",
+                branch_name
+            )));
+        }
+
         let resolved = self
             .resolve_path_locked(&branches, branch_name, rel_path)?
             .ok_or_else(|| errno_error(libc::ENOENT))?;
