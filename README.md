@@ -64,7 +64,7 @@ brew install macfuse pkg-config
 
 ### macOS Support
 
-BranchFS supports macOS via **macFUSE**. 
+BranchFS supports macOS via **macFUSE**.
 
 1. **Install macFUSE**: `brew install macfuse pkg-config`.
 2. **System Extension**: You must approve the `macFUSE` system extension in System Settings. On Apple Silicon Macs, you may need to enable third-party kernel extensions in Recovery Mode.
@@ -155,6 +155,40 @@ Relaxed multi-writer usage is intended for distributed jobs where nodes write di
 
 `--agent` is a security boundary helper: it hides the mounted control file and virtual branch namespace from the agent-visible tree. The trusted review/commit container must still keep real underlays and the BranchFS store/control channel out of the untrusted agent container.
 
+### CCC cleanup/performance regressions
+
+BranchFS must keep metadata-only operations responsive even when an agent creates or deletes large generated trees such as `.scratch` directories containing old `.ccc-storage` state. In particular:
+
+- `statfs`/`df -h` on a BranchFS mount must not hang behind `rm -rf` metadata traffic; slow unlink/rmdir work runs on an ordered background worker so filesystem operation order is preserved while the FUSE request loop remains responsive.
+- Per-path delete/write bookkeeping must be append-only/O(1) on the hot path; it must not rewrite multi-MB `touches.json` or `tombstones` snapshots for every file or for one stale empty directory.
+- Branch load migrates old-format `touches.json` and bare-line `tombstones` snapshots into `touches.log` and `tombstones.log`, then clears the legacy snapshots. This is an allowed one-time launch cost so old sessions do not keep paying multi-MB JSON/snapshot parse costs on every later daemon start.
+- BranchFS should not create tombstones for paths that were not present in the inherited view: unnecessary tombstones would hide future live-base files. The inherited-existence lookup is therefore still part of delete semantics, but it should be done once per first-touch and outside the FUSE request loop, not repeated or mixed with whole-metadata rewrites.
+- Recursive deletes must not read inherited file bodies merely to record conflict metadata. Deletes record path identity only; writes still keep bounded text content snapshots for later 3-way merge.
+- First-write COW of an inherited regular file must stage the copied file outside the visible delta tree, apply the write there, and atomically rename it into place. The copy/write work runs on the ordered background worker so `statfs` remains responsive, while same-path striped locks preserve concurrent writer semantics.
+- Future changes to first-touch or tombstone persistence should preserve the `touches.log` and `tombstones.log` incremental behavior unless they replace it with an equally bounded non-rewrite store.
+
+Non-privileged regression checks:
+
+```bash
+cargo test legacy_touch_and_tombstone_snapshots_migrate_to_incremental_logs_on_load --lib
+cargo test appends_incrementally --lib
+cargo test blocking_fuse_work_is_spawned_off_the_request_loop --lib
+cargo test cow --lib
+```
+
+Real FUSE responsiveness check (ignored by default because it needs a working FUSE mount):
+
+```bash
+cargo test --test test_integration \
+  test_statfs_responsive_while_deleting_large_scratch_tree \
+  -- --ignored --nocapture
+cargo test --test test_integration \
+  test_statfs_responsive_while_first_writing_large_inherited_file \
+  -- --ignored --nocapture
+```
+
+On CCC development containers, run these through the `branchfs-dev` conda environment described in `AGENTS.md` so `libfuse3` and the linker override are correct.
+
 ### Nested Branches
 
 ```bash
@@ -238,6 +272,30 @@ cat /mnt/workspace/@agent-b/solution.py  # still works
 
 All control-enabled mounts share a single branch namespace managed by the daemon. Branches created through any such mount are visible via `@branch` virtual paths. Mounts started with `--agent`/`--no-control` hide these control paths from the mounted tree. This simplifies multi-agent workflows — each agent accesses its branch via `/@branch-name/` without needing separate mount points.
 
+### Lazy live-base semantics and conflict handling
+
+Lazy branches are not frozen snapshots. Path resolution is always:
+
+```text
+branch delta > branch tombstone > current parent/base
+```
+
+A branch keeps seeing its own delta or tombstone for a touched path, even if
+another branch later commits the same path to the parent/base. Untouched
+inherited paths may reflect newer parent/base commits. Global epoch changes are
+cache-generation events; they should refresh/re-resolve mount state, not make a
+still-valid branch mount permanently return `ESTALE`.
+
+Commit conflict detection is path-level. BranchFS records parent/base identity
+when a branch first touches a path. If the parent/base version changed by commit
+time, regular text files should be attempted as git-style 3-way merges. Clean
+non-overlapping merges are committed as merged content and are not conflicts.
+Unclean overlapping edits, binary files, delete-vs-modify, type changes,
+symlinks/directories, or paths without merge-base content become conflict
+records. Low-level commit still succeeds by default; after auto-merge attempts,
+remaining conflicts use latest-session-wins semantics and should be reported in
+machine-readable form for supervisors such as `ccc-agent`.
+
 ### Commit
 
 Committing merges a **leaf branch** into its immediate parent:
@@ -245,9 +303,10 @@ Committing merges a **leaf branch** into its immediate parent:
 1. Only leaf branches can be committed, attempting to commit a branch with children returns an error
 2. If the parent is **main**: tombstone deletions are applied to the base filesystem, then delta files are copied to base
 3. If the parent is **another branch**: child's delta files are merged into the parent's delta directory, and tombstones are merged (child tombstones shadow parent deltas, child deltas un-tombstone parent tombstones)
-4. The committed branch is removed; epoch increments
-5. **Mount automatically switches to the parent branch** (stays mounted)
-6. Memory-mapped regions trigger `SIGBUS` on next access
+4. A tombstone is preserved only when it hides an inherited path in the parent/base view. If the child deletes a path that exists only as the parent branch's delta, commit removes that parent delta and does **not** add a parent tombstone; create-then-delete is a no-op, not a durable delete.
+5. The committed branch is removed; epoch increments
+6. **Mount automatically switches to the parent branch** (stays mounted)
+7. Memory-mapped regions trigger `SIGBUS` on next access
 
 ### Abort
 

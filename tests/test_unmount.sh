@@ -14,14 +14,14 @@ test_unmount_main() {
     assert "! mountpoint -q '$TEST_MNT'" "Mount point unmounted"
 }
 
-test_unmount_discards_single_branch() {
+test_unmount_does_not_commit_single_branch() {
     setup
     do_mount
     do_create "unmount_test" "main"
 
     echo "branch content" > "$TEST_MNT/branch_file.txt"
 
-    # Unmount (should discard the branch)
+    # Unmount without committing the branch.
     do_unmount
 
     # Should be unmounted
@@ -31,7 +31,7 @@ test_unmount_discards_single_branch() {
     assert_file_not_exists "$TEST_BASE/branch_file.txt" "No changes to base"
 }
 
-test_unmount_cleans_all_branches() {
+test_unmount_preserves_all_branches() {
     setup
     do_mount
 
@@ -42,18 +42,19 @@ test_unmount_cleans_all_branches() {
     do_create "child_branch" "parent_branch"
     echo "child content" > "$TEST_MNT/child_file.txt"
 
-    # Unmount — daemon exits, branches cleaned up on next startup
+    # Unmount — daemon exits, but branch stores are durable and should be
+    # available again on the next mount for review/commit/abort.
     do_unmount
 
     # Should be unmounted
     assert "! mountpoint -q '$TEST_MNT'" "Mount point unmounted"
 
-    # Remount - daemon restarts fresh, only main branch
+    # Remount - daemon restarts and reloads the durable branch store.
     do_mount
 
     assert_branch_exists "main" "Main branch exists after remount"
-    assert_branch_not_exists "parent_branch" "Parent branch cleaned up on unmount"
-    assert_branch_not_exists "child_branch" "Child branch cleaned up on unmount"
+    assert_branch_exists "parent_branch" "Parent branch preserved on unmount"
+    assert_branch_exists "child_branch" "Child branch preserved on unmount"
 
     # No changes to base (nothing was committed)
     assert_file_not_exists "$TEST_BASE/parent_file.txt" "No parent file in base"
@@ -82,20 +83,19 @@ test_unmount_cleanup() {
     # Unmount — daemon exits when last mount removed
     do_unmount
 
-    # After daemon restart, branches dir is cleaned up
-    # (daemon cleans branches/ on startup for fresh state)
+    # After daemon restart, durable branch metadata remains for review.
     do_mount
     local branch_count_after
     branch_count_after=$(ls "$branches_dir" 2>/dev/null | wc -l)
-    # Only "main" branch should exist after fresh start
-    assert "[[ $branch_count_after -eq 1 ]]" "Only main branch after remount"
+    assert "[[ $branch_count_after -eq $branch_count_before ]]" "Branches preserved after remount"
+    assert_branch_exists "cleanup_test" "cleanup_test branch preserved after remount"
     do_unmount
 }
 
 # Run tests
 run_test "Unmount Main" test_unmount_main
-run_test "Unmount Discards Single Branch" test_unmount_discards_single_branch
-run_test "Unmount Cleans All Branches" test_unmount_cleans_all_branches
+run_test "Unmount Does Not Commit Single Branch" test_unmount_does_not_commit_single_branch
+run_test "Unmount Preserves All Branches" test_unmount_preserves_all_branches
 run_test "Unmount Cleanup" test_unmount_cleanup
 
 print_summary

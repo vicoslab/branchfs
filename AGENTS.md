@@ -17,9 +17,11 @@ Add a lazy, relaxed multi-writer mode suitable for huge NFS-backed CCC writable 
 7. Add freeze/thaw/read-only branch state if feasible; mutating FUSE ops on frozen branches should fail.
 8. Add tests where possible.
 
-## Relaxed multi-writer semantics
+## Relaxed multi-writer and multi-session semantics
 
-Support multiple nodes writing different files in the same branch store. Do not attempt strict same-file concurrent write correctness in this pass. Document same-path write/delete/rename races as undefined or future work.
+Support multiple nodes writing different files in the same branch store. Lazy branches use live-base inheritance, not frozen snapshots: branch deltas/tombstones win for touched paths, and untouched inherited paths may reflect newer parent/base commits.
+
+Same-path parent changes must be handled at commit/review time with path-level tracking. For regular text files, attempt a bounded git-style 3-way merge first; clean non-overlapping merges should be treated like disjoint-path commits. Remaining overlapping/binary/type/delete conflicts should not make low-level commit fail by default; latest-session-wins applies, with durable machine-readable conflict records for ccc-agent/LLM/human review.
 
 ## Security boundary
 

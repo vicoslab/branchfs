@@ -4,14 +4,14 @@ use std::fs::File;
 use std::io::{Read as IoRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl,
     ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::branch::BranchManager;
 use crate::error::BranchError;
@@ -28,6 +28,10 @@ pub(crate) const BLOCK_SIZE: u32 = 512;
 
 pub(crate) const CTL_FILE: &str = ".branchfs_ctl";
 pub(crate) const CTL_INO: u64 = u64::MAX - 1;
+
+type BlockingJob = Box<dyn FnOnce() + Send + 'static>;
+const BLOCKING_WORKERS: usize = 1;
+static BLOCKING_WORK_QUEUE: OnceLock<mpsc::Sender<BlockingJob>> = OnceLock::new();
 
 /// Cached open file descriptor for the most recently read inode.
 /// Eliminates per-read resolve_path() (2-3 stat syscalls on non-existent
@@ -113,7 +117,7 @@ impl WriteFileCache {
 
 pub struct BranchFs {
     pub(crate) manager: Arc<BranchManager>,
-    pub(crate) inodes: InodeManager,
+    pub(crate) inodes: Arc<InodeManager>,
     pub(crate) mountpoint: PathBuf,
     pub(crate) current_epoch: AtomicU64,
     /// Per-branch ctl inode numbers: branch_name → ino
@@ -147,7 +151,7 @@ impl BranchFs {
         let current_epoch = manager.get_epoch();
         Self {
             manager,
-            inodes: InodeManager::new(),
+            inodes: Arc::new(InodeManager::new()),
             mountpoint,
             current_epoch: AtomicU64::new(current_epoch),
             branch_ctl_inodes: RwLock::new(HashMap::new()),
@@ -174,6 +178,132 @@ impl BranchFs {
         self.manager.is_branch_writable(branch)
     }
 
+    fn blocking_work_queue() -> &'static mpsc::Sender<BlockingJob> {
+        BLOCKING_WORK_QUEUE.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<BlockingJob>();
+            let rx = Arc::new(Mutex::new(rx));
+            for idx in 0..BLOCKING_WORKERS {
+                let rx = rx.clone();
+                std::thread::Builder::new()
+                    .name(format!("branchfs-blocking-{}", idx))
+                    .spawn(move || loop {
+                        let job = rx.lock().recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => break,
+                        }
+                    })
+                    .expect("spawn branchfs blocking worker");
+            }
+            tx
+        })
+    }
+
+    pub(crate) fn spawn_blocking_work<F>(_name: &'static str, work: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let job: BlockingJob = Box::new(work);
+        if let Err(err) = Self::blocking_work_queue().send(job) {
+            (err.0)();
+        }
+    }
+
+    fn reply_from_delete_result(
+        manager: &BranchManager,
+        branch: &str,
+        inode_path: &str,
+        inodes: &InodeManager,
+        reply: ReplyEmpty,
+        result: crate::Result<()>,
+        stale_errno: Option<i32>,
+    ) {
+        match result {
+            Ok(()) if stale_errno.is_some() && !manager.is_branch_valid(branch) => {
+                reply.error(stale_errno.unwrap())
+            }
+            Ok(()) => {
+                inodes.remove(inode_path);
+                reply.ok();
+            }
+            Err(_) if stale_errno.is_some() && !manager.is_branch_valid(branch) => {
+                reply.error(stale_errno.unwrap())
+            }
+            Err(e) => reply.error(Self::branch_error_errno(&e)),
+        }
+    }
+
+    fn delete_path_async(
+        manager: Arc<BranchManager>,
+        inodes: Arc<InodeManager>,
+        branch: String,
+        rel_path: String,
+        inode_path: String,
+        stale_errno: Option<i32>,
+        reply: ReplyEmpty,
+    ) {
+        Self::spawn_blocking_work("branchfs-delete", move || {
+            let result = manager.delete_path_in_branch(&branch, &rel_path);
+            Self::reply_from_delete_result(
+                &manager,
+                &branch,
+                &inode_path,
+                &inodes,
+                reply,
+                result,
+                stale_errno,
+            );
+        });
+    }
+
+    fn rmdir_path_async(
+        manager: Arc<BranchManager>,
+        inodes: Arc<InodeManager>,
+        branch: String,
+        rel_path: String,
+        inode_path: String,
+        stale_errno: Option<i32>,
+        reply: ReplyEmpty,
+    ) {
+        Self::spawn_blocking_work("branchfs-rmdir", move || {
+            let result = manager.rmdir_path_in_branch(&branch, &rel_path);
+            Self::reply_from_delete_result(
+                &manager,
+                &branch,
+                &inode_path,
+                &inodes,
+                reply,
+                result,
+                stale_errno,
+            );
+        });
+    }
+
+    fn branch_error_errno(err: &BranchError) -> i32 {
+        match err {
+            BranchError::Io(e) => e.raw_os_error().unwrap_or(libc::EIO),
+            BranchError::NotFound(_) => libc::ENOENT,
+            BranchError::Invalid(_) => libc::EROFS,
+            _ => libc::EIO,
+        }
+    }
+
+    fn write_data_async(
+        manager: Arc<BranchManager>,
+        branch: String,
+        rel_path: String,
+        offset: i64,
+        data: Vec<u8>,
+        reply: ReplyWrite,
+    ) {
+        Self::spawn_blocking_work("branchfs-write", move || {
+            match manager.write_data_to_branch(&branch, &rel_path, offset, &data) {
+                Ok(n) => reply.written(n),
+                Err(e) => reply.error(Self::branch_error_errno(&e)),
+            }
+        });
+    }
+
     pub(crate) fn write_denied_error(&self, branch: &str) -> Option<i32> {
         if self.branch_writable(branch) {
             None
@@ -188,10 +318,37 @@ impl BranchFs {
             || (flags & libc::O_APPEND) != 0
     }
 
+    fn effective_write_offset(
+        flags: i32,
+        requested_offset: i64,
+        visible_len: Option<u64>,
+    ) -> std::result::Result<i64, i32> {
+        if requested_offset < 0 {
+            return Err(libc::EINVAL);
+        }
+        if (flags & libc::O_APPEND) == 0 {
+            return Ok(requested_offset);
+        }
+        i64::try_from(visible_len.unwrap_or(0)).map_err(|_| libc::EFBIG)
+    }
+
+    fn file_len(path: Option<&Path>) -> Option<u64> {
+        path.and_then(|p| p.metadata().ok()).map(|m| m.len())
+    }
+
     pub(crate) fn is_stale(&self) -> bool {
         let branch_name = self.get_branch_name();
-        self.manager.get_epoch() != self.current_epoch.load(Ordering::SeqCst)
-            || !self.manager.is_branch_valid(&branch_name)
+        let manager_epoch = self.manager.get_epoch();
+        let mount_epoch = self.current_epoch.load(Ordering::SeqCst);
+        if manager_epoch != mount_epoch {
+            // A global epoch change means some branch lifecycle operation happened
+            // elsewhere. Refresh this mount's epoch so per-inode fd caches keyed by
+            // the old epoch are bypassed, but do not mark a still-valid mounted
+            // branch permanently stale. Long-lived agent mounts must survive
+            // unrelated branch create/commit/freeze/thaw operations.
+            self.current_epoch.store(manager_epoch, Ordering::SeqCst);
+        }
+        !self.manager.is_branch_valid(&branch_name)
     }
 
     /// Switch to a different branch (used after commit/abort to switch to parent)
@@ -586,11 +743,11 @@ impl Filesystem for BranchFs {
             return;
         }
 
-        // Honor staleness before serving a cached fd, exactly like the slow path
-        // and every other callback. A foreign commit (epoch arm) or abort
-        // (is_branch_valid arm) must surface as ESTALE, not a read from a stale
-        // backing file (issue #30). This still skips the resolve()/File::open()
-        // the cache exists to avoid.
+        // Refresh staleness/epoch before serving a cached fd, exactly like the
+        // slow path and every other callback. A foreign branch lifecycle event
+        // advances the global epoch; is_stale() refreshes this mount's epoch so
+        // fd caches keyed by the old epoch are bypassed. If the mounted branch
+        // itself was removed, it still surfaces as ESTALE.
         if self.is_stale() {
             reply.error(libc::ESTALE);
             return;
@@ -704,7 +861,7 @@ impl Filesystem for BranchFs {
         offset: i64,
         data: &[u8],
         _write_flags: u32,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
@@ -732,11 +889,17 @@ impl Filesystem for BranchFs {
             return;
         }
 
-        // Same staleness gate as read(): never write through a cached fd after a
-        // foreign commit/abort (issue #30). Placed after the ctl handlers so
-        // commit/abort ctl writes are not themselves gated.
+        // Same staleness/epoch refresh as read(): never write through a cached
+        // fd after another branch lifecycle event changes the global epoch, and
+        // still reject writes if the mounted branch itself was removed. Placed
+        // after the ctl handlers so commit/abort ctl writes are not themselves
+        // gated.
         if self.is_stale() {
             reply.error(libc::ESTALE);
+            return;
+        }
+        if offset < 0 {
+            reply.error(libc::EINVAL);
             return;
         }
 
@@ -746,20 +909,29 @@ impl Filesystem for BranchFs {
         // to the same inode (after COW is already done).
         if let Some(file) = self.write_cache.get(ino, epoch) {
             use std::io::{Seek, SeekFrom, Write};
-            // Check quota for writes that extend the file
+            // Check quota for writes that extend the file. With O_APPEND, the
+            // kernel-supplied offset is not authoritative for FUSE writes; append
+            // at the current delta EOF instead.
             let old_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-            let write_end = offset as u64 + data.len() as u64;
+            let write_offset = match Self::effective_write_offset(flags, offset, Some(old_size)) {
+                Ok(offset) => offset as u64,
+                Err(errno) => {
+                    reply.error(errno);
+                    return;
+                }
+            };
+            let write_end = write_offset + data.len() as u64;
             if write_end > old_size && self.manager.quota.check(write_end - old_size).is_err() {
                 reply.error(libc::ENOSPC);
                 return;
             }
-            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+            if file.seek(SeekFrom::Start(write_offset)).is_err() {
                 reply.error(libc::EIO);
                 return;
             }
             match file.write(data) {
                 Ok(n) => {
-                    let new_end = offset as u64 + n as u64;
+                    let new_end = write_offset + n as u64;
                     if new_end > old_size {
                         self.manager.quota.add(new_end - old_size);
                     }
@@ -779,7 +951,7 @@ impl Filesystem for BranchFs {
             }
         };
 
-        let (delta, is_root) = match classify_path(&path) {
+        let (delta, is_root, write_offset) = match classify_path(&path) {
             PathContext::BranchDir(_) | PathContext::BranchCtl(_) => {
                 reply.error(libc::EPERM);
                 return;
@@ -793,21 +965,72 @@ impl Filesystem for BranchFs {
                     reply.error(libc::ENOENT);
                     return;
                 }
+                let append_len = if (flags & libc::O_APPEND) != 0 {
+                    let visible = self.resolve_for_branch(&branch, &rel_path);
+                    Self::file_len(visible.as_deref())
+                } else {
+                    None
+                };
+                let write_offset = match Self::effective_write_offset(flags, offset, append_len) {
+                    Ok(offset) => offset,
+                    Err(errno) => {
+                        reply.error(errno);
+                        return;
+                    }
+                };
+                if !self.manager.branch_has_delta(&branch, &rel_path) {
+                    Self::write_data_async(
+                        self.manager.clone(),
+                        branch,
+                        rel_path,
+                        write_offset,
+                        data.to_vec(),
+                        reply,
+                    );
+                    return;
+                }
                 match self.ensure_cow_for_branch(&branch, &rel_path) {
-                    Ok(p) => (p, false),
+                    Ok(p) => (p, false, write_offset as u64),
                     Err(e) => {
                         reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                         return;
                     }
                 }
             }
-            _ => match self.ensure_cow(&path) {
-                Ok(p) => (p, true),
-                Err(e) => {
-                    reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+            _ => {
+                let current_branch = self.get_branch_name();
+                let append_len = if (flags & libc::O_APPEND) != 0 {
+                    let visible = self.resolve_for_branch(&current_branch, &path);
+                    Self::file_len(visible.as_deref())
+                } else {
+                    None
+                };
+                let write_offset = match Self::effective_write_offset(flags, offset, append_len) {
+                    Ok(offset) => offset,
+                    Err(errno) => {
+                        reply.error(errno);
+                        return;
+                    }
+                };
+                if !self.manager.branch_has_delta(&current_branch, &path) {
+                    Self::write_data_async(
+                        self.manager.clone(),
+                        current_branch,
+                        path.clone(),
+                        write_offset,
+                        data.to_vec(),
+                        reply,
+                    );
                     return;
                 }
-            },
+                match self.ensure_cow(&path) {
+                    Ok(p) => (p, true, write_offset as u64),
+                    Err(e) => {
+                        reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                        return;
+                    }
+                }
+            }
         };
 
         // Open delta for writing and cache the fd
@@ -830,12 +1053,12 @@ impl Filesystem for BranchFs {
         if let Some(file) = self.write_cache.get(ino, epoch) {
             use std::io::{Seek, SeekFrom, Write};
             let old_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-            let write_end = offset as u64 + data.len() as u64;
+            let write_end = write_offset + data.len() as u64;
             if write_end > old_size && self.manager.quota.check(write_end - old_size).is_err() {
                 reply.error(libc::ENOSPC);
                 return;
             }
-            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+            if file.seek(SeekFrom::Start(write_offset)).is_err() {
                 reply.error(libc::EIO);
                 return;
             }
@@ -845,7 +1068,7 @@ impl Filesystem for BranchFs {
                         reply.error(libc::ESTALE);
                         return;
                     }
-                    let new_end = offset as u64 + n as u64;
+                    let new_end = write_offset + n as u64;
                     if new_end > old_size {
                         self.manager.quota.add(new_end - old_size);
                     }
@@ -1038,7 +1261,13 @@ impl Filesystem for BranchFs {
             } else {
                 format!("{}/{}", parent_rel, name_str)
             };
-            let delta = self.get_delta_path_for_branch(&branch, &rel_path);
+            let delta = match self.ensure_cow_for_branch(&branch, &rel_path) {
+                Ok(p) => p,
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
             if storage::ensure_parent_dirs(&delta).is_err() {
                 reply.error(libc::EIO);
                 return;
@@ -1076,7 +1305,13 @@ impl Filesystem for BranchFs {
                         reply.error(errno);
                         return;
                     }
-                    let delta = self.get_delta_path(&path);
+                    let delta = match self.ensure_cow(&path) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    };
                     if storage::ensure_parent_dirs(&delta).is_err() {
                         reply.error(libc::EIO);
                         return;
@@ -1148,16 +1383,16 @@ impl Filesystem for BranchFs {
                 format!("{}/{}", parent_rel, name_str)
             };
 
-            let result = self.manager.delete_path_in_branch(&branch, &rel_path);
-
-            if result.is_err() {
-                reply.error(libc::EIO);
-                return;
-            }
-
             let inode_path = format!("/@{}{}", branch, rel_path);
-            self.inodes.remove(&inode_path);
-            reply.ok();
+            Self::delete_path_async(
+                self.manager.clone(),
+                self.inodes.clone(),
+                branch,
+                rel_path,
+                inode_path,
+                None,
+                reply,
+            );
         } else {
             // Root-path unlink (or EPERM for ctl files)
             match classify_path(&parent_path) {
@@ -1176,15 +1411,15 @@ impl Filesystem for BranchFs {
                         reply.error(errno);
                         return;
                     }
-                    let result = self.manager.delete_path_in_branch(&current_branch, &path);
-
-                    if result.is_err() || self.is_stale() {
-                        reply.error(libc::ESTALE);
-                        return;
-                    }
-
-                    self.inodes.remove(&path);
-                    reply.ok();
+                    Self::delete_path_async(
+                        self.manager.clone(),
+                        self.inodes.clone(),
+                        current_branch,
+                        path.clone(),
+                        path,
+                        Some(libc::ESTALE),
+                        reply,
+                    );
                 }
                 _ => {
                     reply.error(libc::ENOENT);
@@ -1194,7 +1429,85 @@ impl Filesystem for BranchFs {
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        self.unlink(_req, parent, name, reply);
+        let parent_path = match self.inodes.get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let name_str = name.to_string_lossy();
+
+        let branch_ctx = match classify_path(&parent_path) {
+            PathContext::BranchDir(b) => Some((b, "/".to_string())),
+            PathContext::BranchPath(b, rel) => Some((b, rel)),
+            _ => None,
+        };
+
+        if let Some((branch, parent_rel)) = branch_ctx {
+            if name_str.starts_with('@') || *name_str == *CTL_FILE {
+                reply.error(libc::EPERM);
+                return;
+            }
+
+            if !self.manager.is_branch_valid(&branch) {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            if let Some(errno) = self.write_denied_error(&branch) {
+                reply.error(errno);
+                return;
+            }
+
+            let rel_path = if parent_rel == "/" {
+                format!("/{}", name_str)
+            } else {
+                format!("{}/{}", parent_rel, name_str)
+            };
+
+            let inode_path = format!("/@{}{}", branch, rel_path);
+            Self::rmdir_path_async(
+                self.manager.clone(),
+                self.inodes.clone(),
+                branch,
+                rel_path,
+                inode_path,
+                None,
+                reply,
+            );
+        } else {
+            match classify_path(&parent_path) {
+                PathContext::BranchCtl(_) | PathContext::RootCtl => {
+                    reply.error(libc::EPERM);
+                }
+                PathContext::RootPath(rp) => {
+                    let path = if rp == "/" {
+                        format!("/{}", name_str)
+                    } else {
+                        format!("{}/{}", rp, name_str)
+                    };
+
+                    let current_branch = self.get_branch_name();
+                    if let Some(errno) = self.write_denied_error(&current_branch) {
+                        reply.error(errno);
+                        return;
+                    }
+                    Self::rmdir_path_async(
+                        self.manager.clone(),
+                        self.inodes.clone(),
+                        current_branch,
+                        path.clone(),
+                        path,
+                        Some(libc::ESTALE),
+                        reply,
+                    );
+                }
+                _ => {
+                    reply.error(libc::ENOENT);
+                }
+            }
+        }
     }
 
     fn rename(
@@ -1318,7 +1631,13 @@ impl Filesystem for BranchFs {
             }
         };
 
-        let dst_delta = self.get_delta_path_for_branch(&branch, &dst_rel);
+        let dst_delta = match self.ensure_cow_for_branch(&branch, &dst_rel) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         if storage::ensure_parent_dirs(&dst_delta).is_err() {
             reply.error(libc::EIO);
             return;
@@ -1355,12 +1674,12 @@ impl Filesystem for BranchFs {
             if src_inherited {
                 b.add_tombstone(&src_rel)?;
             } else {
-                b.remove_tombstone(&src_rel);
+                b.remove_tombstone(&src_rel)?;
             }
             if dst_existed {
                 b.add_tombstone(&dst_rel)?;
             }
-            b.remove_tombstone(&dst_rel);
+            b.remove_tombstone(&dst_rel)?;
             Ok(())
         });
         if result.is_err() {
@@ -1799,7 +2118,13 @@ impl Filesystem for BranchFs {
             } else {
                 format!("{}/{}", parent_rel, name_str)
             };
-            let delta = self.get_delta_path_for_branch(&branch, &rel_path);
+            let delta = match self.ensure_cow_for_branch(&branch, &rel_path) {
+                Ok(p) => p,
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
             match std::fs::create_dir_all(&delta) {
                 Ok(_) => {
                     use std::os::unix::fs::PermissionsExt;
@@ -1832,7 +2157,13 @@ impl Filesystem for BranchFs {
                         reply.error(errno);
                         return;
                     }
-                    let delta = self.get_delta_path(&path);
+                    let delta = match self.ensure_cow(&path) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    };
                     match std::fs::create_dir_all(&delta) {
                         Ok(_) => {
                             use std::os::unix::fs::PermissionsExt;
@@ -1942,7 +2273,13 @@ impl Filesystem for BranchFs {
             } else {
                 format!("{}/{}", parent_rel, name_str)
             };
-            let delta = self.get_delta_path_for_branch(&branch, &rel_path);
+            let delta = match self.ensure_cow_for_branch(&branch, &rel_path) {
+                Ok(p) => p,
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
             if storage::ensure_parent_dirs(&delta).is_err() {
                 reply.error(libc::EIO);
                 return;
@@ -1974,7 +2311,13 @@ impl Filesystem for BranchFs {
                         reply.error(errno);
                         return;
                     }
-                    let delta = self.get_delta_path(&path);
+                    let delta = match self.ensure_cow(&path) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    };
                     if storage::ensure_parent_dirs(&delta).is_err() {
                         reply.error(libc::EIO);
                         return;
@@ -2054,7 +2397,9 @@ mod tests {
     use super::*;
     use crate::branch::BranchManager;
     use std::path::PathBuf;
+    use std::sync::mpsc;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn test_manager() -> Arc<BranchManager> {
         let root = std::env::temp_dir().join(format!("branchfs-isstale-{}", uuid::Uuid::new_v4()));
@@ -2077,20 +2422,85 @@ mod tests {
     }
 
     #[test]
-    fn is_stale_true_after_foreign_commit() {
-        // A commit elsewhere advances the global epoch; this mount's local epoch
-        // lags, so the epoch arm of is_stale() fires. This is what gates the
-        // fast paths against reading a backing file a commit just replaced.
+    fn is_stale_false_after_unrelated_branch_epoch_change() {
+        // Long-lived agent mounts must survive unrelated branch lifecycle events.
+        // A foreign create/commit advances the manager epoch so caches need a new
+        // epoch key, but the mounted branch is still valid and should not return
+        // ESTALE for every path.
         let mgr = test_manager();
         let mp = PathBuf::from("/mnt/a");
-        mgr.set_mount_branch(&mp, "main");
+        mgr.create_branch("agent", "main").unwrap();
+        mgr.set_mount_branch(&mp, "agent");
         let fs = BranchFs::new(mgr.clone(), mp, false, true);
         assert!(!fs.is_stale());
 
-        mgr.create_branch("feat", "main").unwrap();
-        mgr.commit("feat").unwrap();
+        mgr.create_branch("other", "main").unwrap();
+        mgr.commit("other").unwrap();
+        let manager_epoch = mgr.get_epoch();
+        assert_ne!(
+            fs.current_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            manager_epoch,
+            "test setup should leave the mount epoch behind the manager epoch"
+        );
 
-        assert!(fs.is_stale(), "a foreign commit must make the mount stale");
+        assert!(
+            !fs.is_stale(),
+            "an unrelated branch epoch change must not stale a still-valid mount"
+        );
+        assert_eq!(
+            fs.current_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            manager_epoch,
+            "checking staleness should refresh the mount epoch so fd caches miss"
+        );
+    }
+
+    #[test]
+    fn append_writes_use_visible_file_length_as_offset() {
+        assert_eq!(
+            BranchFs::effective_write_offset(libc::O_APPEND, 0, Some(12)).unwrap(),
+            12,
+            "O_APPEND must ignore the kernel-supplied write offset and append at EOF"
+        );
+        assert_eq!(
+            BranchFs::effective_write_offset(libc::O_APPEND, 5, Some(12)).unwrap(),
+            12,
+            "O_APPEND must append even when a non-zero requested offset is supplied"
+        );
+        assert_eq!(
+            BranchFs::effective_write_offset(0, 5, Some(12)).unwrap(),
+            5,
+            "non-append writes must preserve their requested offset"
+        );
+    }
+
+    #[test]
+    fn blocking_fuse_work_is_spawned_off_the_request_loop() {
+        // fuser 0.16 dispatches one request at a time on the session thread.
+        // Heavy deletes must therefore be moved to a worker thread and reply
+        // asynchronously; otherwise unrelated requests such as statfs/df wait
+        // behind rm -rf metadata work.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (unblock_tx, unblock_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        BranchFs::spawn_blocking_work("branchfs-test-worker", move || {
+            started_tx.send(()).unwrap();
+            unblock_rx.recv().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should start promptly");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "spawn_blocking_work must return without waiting for slow filesystem work"
+        );
+
+        unblock_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should finish after it is unblocked");
     }
 
     #[test]
@@ -2098,7 +2508,7 @@ mod tests {
         // Abort removes the branch but does NOT bump the epoch — staleness is
         // signaled through is_branch_valid(). This is how ESTALE implements
         // abort, and why the fast-path gate must call full is_stale(), not just
-        // compare epochs.
+        // refresh epoch keys.
         let mgr = test_manager();
         let mp = PathBuf::from("/mnt/a");
         mgr.create_branch("feat", "main").unwrap();

@@ -1,10 +1,12 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 use fuser::Notifier;
 use parking_lot::{Mutex, RwLock};
@@ -13,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{BranchError, Result};
 use crate::inode::ROOT_INO;
 use crate::storage;
+
+const PATH_LOCK_STRIPES: usize = 256;
 
 /// Tracks storage usage across all branches and enforces an optional quota.
 /// Only counts delta files (the actual disk cost of branching).
@@ -87,6 +91,10 @@ impl StorageQuota {
     }
 }
 
+fn errno_error(errno: i32) -> BranchError {
+    BranchError::Io(std::io::Error::from_raw_os_error(errno))
+}
+
 /// Remove a file or directory at `path`, following symlinks for the type check.
 /// Returns `Ok(())` even if the path doesn't exist; propagates real I/O errors.
 fn remove_entry(path: &Path) -> std::io::Result<()> {
@@ -101,28 +109,43 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
 /// Temporarily add owner rwx bits to an internal branch-store directory so the
 /// supervisor can inspect it even if the agent-visible mode is 000. The original
 /// mode is restored when the guard is dropped.
-struct StoreDirModeGuard<'a> {
-    path: &'a Path,
+struct StoreDirModeGuard {
+    path: PathBuf,
     original_mode: Option<u32>,
 }
 
-impl<'a> StoreDirModeGuard<'a> {
-    fn new(path: &'a Path) -> std::io::Result<Self> {
+impl StoreDirModeGuard {
+    fn new(path: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            path,
+            path: path.to_path_buf(),
             original_mode: add_owner_rwx_if_dir(path)?,
         })
     }
 }
 
-impl Drop for StoreDirModeGuard<'_> {
+impl Drop for StoreDirModeGuard {
     fn drop(&mut self) {
         if let Some(mode) = self.original_mode {
             use std::os::unix::fs::PermissionsExt;
 
-            let _ = fs::set_permissions(self.path, fs::Permissions::from_mode(mode));
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(mode));
         }
     }
+}
+
+fn guard_existing_parent_dirs(path: &Path) -> std::io::Result<Vec<StoreDirModeGuard>> {
+    let mut dirs: Vec<PathBuf> = path.ancestors().skip(1).map(Path::to_path_buf).collect();
+    dirs.reverse();
+    let mut guards = Vec::new();
+    for dir in dirs {
+        match dir.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_dir() => guards.push(StoreDirModeGuard::new(&dir)?),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(guards)
 }
 
 fn add_owner_rwx_if_dir(path: &Path) -> std::io::Result<Option<u32>> {
@@ -176,6 +199,57 @@ fn remove_branch_store_dir_all(path: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+fn invalid_offset() -> BranchError {
+    BranchError::Io(std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn file_too_large() -> BranchError {
+    BranchError::Io(std::io::Error::from_raw_os_error(libc::EFBIG))
+}
+
+fn normalize_branch_rel_path(path: &str) -> Result<String> {
+    if path.is_empty() || path.contains('\0') {
+        return Err(BranchError::Invalid(
+            "path cannot be empty or contain null bytes".into(),
+        ));
+    }
+
+    let mut parts = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(BranchError::Invalid(format!(
+                    "path must stay inside the branch: {}",
+                    path
+                )));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return Err(BranchError::Invalid("cannot revert the branch root".into()));
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn path_is_same_or_descendant(candidate: &str, parent: &str) -> bool {
+    let candidate = candidate.trim_matches('/');
+    let parent = parent.trim_matches('/');
+    candidate == parent || candidate.starts_with(&format!("{}/", parent))
+}
+
+fn write_data_to_file(path: &Path, offset: u64, data: &[u8]) -> Result<u32> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    Ok(file.write(data)? as u32)
 }
 
 /// An in-progress merge that prepares all of its destructive work as
@@ -252,6 +326,7 @@ impl StagedMerge {
             self.stage_delete(&dest)?;
         }
         let tmp = commit_side_path(&dest, "tmp");
+        let _source_guards = guard_existing_parent_dirs(src)?;
         storage::copy_entry(src, &tmp)?;
         if let Ok(meta) = src.symlink_metadata() {
             self.bytes += meta.len();
@@ -301,34 +376,24 @@ fn commit_side_path(target: &Path, tag: &str) -> PathBuf {
     target.with_file_name(name)
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InheritanceMode {
     /// Resolve inherited paths recursively from the parent/base at lookup time.
     /// Branch creation is O(1) and does not scan or copy the inherited tree.
+    #[default]
     Lazy,
     /// Preserve the legacy behavior: recursively snapshot the visible parent
     /// tree into this branch's inherited directory at branch creation time.
     Snapshot,
 }
 
-impl Default for InheritanceMode {
-    fn default() -> Self {
-        Self::Lazy
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BranchState {
+    #[default]
     Open,
     Frozen,
-}
-
-impl Default for BranchState {
-    fn default() -> Self {
-        Self::Open
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -376,19 +441,200 @@ pub struct BranchStatus {
     pub diff: Vec<DiffEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathIdentity {
+    pub exists: bool,
+    pub kind: String,
+    pub bytes: u64,
+    pub mtime_ns: Option<i128>,
+}
+
+impl PathIdentity {
+    fn missing() -> Self {
+        Self {
+            exists: false,
+            kind: "missing".to_string(),
+            bytes: 0,
+            mtime_ns: None,
+        }
+    }
+
+    fn from_path(path: Option<&Path>) -> Self {
+        let Some(path) = path else {
+            return Self::missing();
+        };
+        let Ok(meta) = path.symlink_metadata() else {
+            return Self::missing();
+        };
+        let kind = if meta.file_type().is_dir() {
+            "dir"
+        } else if meta.file_type().is_symlink() {
+            "symlink"
+        } else if meta.file_type().is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        let mtime_ns = meta.modified().ok().and_then(|t| {
+            t.duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_nanos() as i128)
+        });
+        Self {
+            exists: true,
+            kind: kind.to_string(),
+            bytes: if meta.file_type().is_file() {
+                meta.len()
+            } else {
+                0
+            },
+            mtime_ns,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TouchRecord {
+    pub path: String,
+    pub base_at_first_touch: PathIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_content_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitAutoMerge {
+    pub path: String,
+    pub resolution: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitConflict {
+    pub path: String,
+    pub session_action: String,
+    pub resolution: String,
+    pub reason: String,
+    pub base_at_first_touch: PathIdentity,
+    pub base_at_commit: PathIdentity,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitOutcome {
+    pub parent: String,
+    pub auto_merges: Vec<CommitAutoMerge>,
+    pub conflicts: Vec<CommitConflict>,
+}
+
+const MAX_TEXT_MERGE_BYTES: u64 = 1024 * 1024;
+
+fn touch_content_key(rel_path: &str) -> String {
+    // Keep filenames bounded to avoid ENAMETOOLONG for deep/long branch paths.
+    // Use a stable hash so keys survive daemon restarts.
+    let mut hash: u64 = 14695981039346656037; // FNV-1a 64-bit offset basis
+    for &b in rel_path.as_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211); // FNV-1a 64-bit prime
+    }
+    format!("{:016x}.base", hash)
+}
+
+fn read_bounded_text(path: &Path) -> Result<Option<Vec<u8>>> {
+    let meta = match path.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.file_type().is_file() || meta.len() > MAX_TEXT_MERGE_BYTES {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+fn split_lines_keepends(text: &str) -> Vec<String> {
+    text.split_inclusive('\n').map(|s| s.to_string()).collect()
+}
+
+fn changed_range(base: &[String], changed: &[String]) -> (usize, usize, Vec<String>) {
+    let mut prefix = 0;
+    while prefix < base.len() && prefix < changed.len() && base[prefix] == changed[prefix] {
+        prefix += 1;
+    }
+
+    let mut suffix = 0;
+    while suffix < base.len().saturating_sub(prefix)
+        && suffix < changed.len().saturating_sub(prefix)
+        && base[base.len() - 1 - suffix] == changed[changed.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let base_end = base.len() - suffix;
+    let changed_end = changed.len() - suffix;
+    (prefix, base_end, changed[prefix..changed_end].to_vec())
+}
+
+fn try_three_way_text_merge(base: &[u8], current: &[u8], session: &[u8]) -> Option<Vec<u8>> {
+    if current == session {
+        return Some(session.to_vec());
+    }
+    if base == current {
+        return Some(session.to_vec());
+    }
+    if base == session {
+        return Some(current.to_vec());
+    }
+
+    let base_text = std::str::from_utf8(base).ok()?;
+    let current_text = std::str::from_utf8(current).ok()?;
+    let session_text = std::str::from_utf8(session).ok()?;
+    let base_lines = split_lines_keepends(base_text);
+    let current_lines = split_lines_keepends(current_text);
+    let session_lines = split_lines_keepends(session_text);
+
+    let (cur_start, cur_end, cur_repl) = changed_range(&base_lines, &current_lines);
+    let (ses_start, ses_end, ses_repl) = changed_range(&base_lines, &session_lines);
+
+    let non_overlapping = cur_end <= ses_start || ses_end <= cur_start;
+    if !non_overlapping {
+        return None;
+    }
+
+    let mut merged = Vec::new();
+    if cur_start <= ses_start {
+        merged.extend_from_slice(&base_lines[..cur_start]);
+        merged.extend(cur_repl);
+        merged.extend_from_slice(&base_lines[cur_end..ses_start]);
+        merged.extend(ses_repl);
+        merged.extend_from_slice(&base_lines[ses_end..]);
+    } else {
+        merged.extend_from_slice(&base_lines[..ses_start]);
+        merged.extend(ses_repl);
+        merged.extend_from_slice(&base_lines[ses_end..cur_start]);
+        merged.extend(cur_repl);
+        merged.extend_from_slice(&base_lines[cur_end..]);
+    }
+
+    Some(merged.concat().into_bytes())
+}
+
 pub struct Branch {
     pub name: String,
     pub parent: Option<String>,
     pub files_dir: PathBuf,
     pub inherited_dir: PathBuf,
     pub tombstones_file: PathBuf,
+    tombstones_log_file: PathBuf,
+    touches_log_file: PathBuf,
+    touch_content_dir: PathBuf,
+    staging_dir: PathBuf,
     meta_file: PathBuf,
     pub inheritance: InheritanceMode,
     state: RwLock<BranchState>,
     tombstones: RwLock<HashSet<String>>,
-    /// Number of stale (removed-from-memory-but-still-on-disk) tombstone entries.
-    /// When this exceeds the live set size, we compact the file.
-    tombstone_stale: AtomicU64,
+    touches: RwLock<HashMap<String, TouchRecord>>,
     /// How many children have been committed (merged) into this branch.
     pub commit_count: AtomicU64,
     /// Parent's commit_count at the time this branch was forked.
@@ -412,15 +658,23 @@ impl Branch {
         let files_dir = branch_dir.join("files");
         let inherited_dir = branch_dir.join("inherited");
         let tombstones_file = branch_dir.join("tombstones");
+        let tombstones_log_file = branch_dir.join("tombstones.log");
+        let touches_file = branch_dir.join("touches.json");
+        let touches_log_file = branch_dir.join("touches.log");
+        let touch_content_dir = branch_dir.join("touch-content");
+        let staging_dir = branch_dir.join("staging");
         let meta_file = branch_dir.join("meta.json");
 
         fs::create_dir_all(&files_dir)?;
         fs::create_dir_all(&inherited_dir)?;
+        fs::create_dir_all(&touch_content_dir)?;
+        fs::create_dir_all(&staging_dir)?;
         if !tombstones_file.exists() {
             File::create(&tombstones_file)?;
         }
 
-        let tombstones = Self::load_tombstones(&tombstones_file)?;
+        let tombstones = Self::load_tombstones(&tombstones_file, &tombstones_log_file)?;
+        let touches = Self::load_touches(&touches_file, &touches_log_file)?;
 
         let branch = Self {
             name: name.to_string(),
@@ -428,11 +682,15 @@ impl Branch {
             files_dir,
             inherited_dir,
             tombstones_file,
+            tombstones_log_file,
+            touches_log_file,
+            touch_content_dir,
+            staging_dir,
             meta_file,
             inheritance,
             state: RwLock::new(BranchState::Open),
             tombstones: RwLock::new(tombstones),
-            tombstone_stale: AtomicU64::new(0),
+            touches: RwLock::new(touches),
             commit_count: AtomicU64::new(0),
             parent_version_at_fork,
             hide_paths: hide_paths
@@ -449,6 +707,11 @@ impl Branch {
         let files_dir = branch_dir.join("files");
         let inherited_dir = branch_dir.join("inherited");
         let tombstones_file = branch_dir.join("tombstones");
+        let tombstones_log_file = branch_dir.join("tombstones.log");
+        let touches_file = branch_dir.join("touches.json");
+        let touches_log_file = branch_dir.join("touches.log");
+        let touch_content_dir = branch_dir.join("touch-content");
+        let staging_dir = branch_dir.join("staging");
         let meta_file = branch_dir.join("meta.json");
 
         let meta_data = fs::read_to_string(&meta_file)?;
@@ -456,10 +719,19 @@ impl Branch {
 
         fs::create_dir_all(&files_dir)?;
         fs::create_dir_all(&inherited_dir)?;
+        fs::create_dir_all(&touch_content_dir)?;
+        fs::create_dir_all(&staging_dir)?;
         if !tombstones_file.exists() {
             File::create(&tombstones_file)?;
         }
-        let tombstones = Self::load_tombstones(&tombstones_file)?;
+        Self::migrate_legacy_touch_and_tombstone_snapshots(
+            &touches_file,
+            &touches_log_file,
+            &tombstones_file,
+            &tombstones_log_file,
+        )?;
+        let tombstones = Self::load_tombstones(&tombstones_file, &tombstones_log_file)?;
+        let touches = Self::load_touches(&touches_file, &touches_log_file)?;
 
         Ok(Self {
             name: metadata.name,
@@ -467,11 +739,15 @@ impl Branch {
             files_dir,
             inherited_dir,
             tombstones_file,
+            tombstones_log_file,
+            touches_log_file,
+            touch_content_dir,
+            staging_dir,
             meta_file,
             inheritance: metadata.inheritance,
             state: RwLock::new(metadata.state),
             tombstones: RwLock::new(tombstones),
-            tombstone_stale: AtomicU64::new(0),
+            touches: RwLock::new(touches),
             commit_count: AtomicU64::new(metadata.commit_count),
             parent_version_at_fork: metadata.parent_version_at_fork,
             hide_paths: metadata.hide_paths,
@@ -526,15 +802,259 @@ impl Branch {
         self.write_metadata()
     }
 
-    fn load_tombstones(path: &Path) -> Result<HashSet<String>> {
+    fn migrate_legacy_touch_and_tombstone_snapshots(
+        touches_file: &Path,
+        touches_log_file: &Path,
+        tombstones_file: &Path,
+        tombstones_log_file: &Path,
+    ) -> Result<()> {
+        Self::migrate_legacy_touches(touches_file, touches_log_file)?;
+        Self::migrate_legacy_tombstones(tombstones_file, tombstones_log_file)?;
+        Ok(())
+    }
+
+    fn migrate_legacy_tombstones(snapshot_path: &Path, log_path: &Path) -> Result<()> {
+        if !snapshot_path.exists() {
+            return Ok(());
+        }
+        let file = File::open(snapshot_path)?;
+        let mut paths = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if !line.trim().is_empty() {
+                paths.push(line);
+            }
+        }
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut migrated = Vec::new();
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            writeln!(&mut migrated, "+ {}", path)?;
+        }
+        if log_path.exists() {
+            migrated.extend(fs::read(log_path)?);
+        }
+        storage::ensure_parent_dirs(log_path)?;
+        let tmp = log_path.with_extension(format!("log.tmp.{}", uuid::Uuid::new_v4()));
+        fs::write(&tmp, migrated)?;
+        fs::rename(&tmp, log_path)?;
+        fs::write(snapshot_path, b"")?;
+        Ok(())
+    }
+
+    fn migrate_legacy_touches(snapshot_path: &Path, log_path: &Path) -> Result<()> {
+        if !snapshot_path.exists() {
+            return Ok(());
+        }
+        let data = fs::read(snapshot_path)?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let touches: HashMap<String, TouchRecord> = serde_json::from_slice(&data)?;
+        if touches.is_empty() {
+            return Ok(());
+        }
+
+        let mut records: Vec<_> = touches.into_values().collect();
+        records.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut migrated = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut migrated, &record)?;
+            writeln!(&mut migrated)?;
+        }
+        if log_path.exists() {
+            migrated.extend(fs::read(log_path)?);
+        }
+        storage::ensure_parent_dirs(log_path)?;
+        let tmp = log_path.with_extension(format!("log.tmp.{}", uuid::Uuid::new_v4()));
+        fs::write(&tmp, migrated)?;
+        fs::rename(&tmp, log_path)?;
+        fs::write(snapshot_path, b"{}\n")?;
+        Ok(())
+    }
+
+    fn load_tombstones(snapshot_path: &Path, log_path: &Path) -> Result<HashSet<String>> {
         let mut set = HashSet::new();
-        if path.exists() {
-            let file = File::open(path)?;
+        if snapshot_path.exists() {
+            let file = File::open(snapshot_path)?;
             for line in BufReader::new(file).lines() {
-                set.insert(line?);
+                let line = line?;
+                if !line.trim().is_empty() {
+                    set.insert(line);
+                }
+            }
+        }
+
+        if log_path.exists() {
+            let file = File::open(log_path)?;
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(path) = line.strip_prefix("+ ") {
+                    set.insert(path.to_string());
+                } else if let Some(path) = line.strip_prefix("- ") {
+                    set.remove(path);
+                } else {
+                    // Tolerate a bare-path log line as an add for forward/backward
+                    // compatibility with simple append-only tombstone stores.
+                    set.insert(line);
+                }
             }
         }
         Ok(set)
+    }
+
+    fn append_tombstone_op(&self, op: char, path: &str) -> Result<()> {
+        storage::ensure_parent_dirs(&self.tombstones_log_file)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.tombstones_log_file)?;
+        writeln!(file, "{} {}", op, path)?;
+        Ok(())
+    }
+
+    fn load_touches(snapshot_path: &Path, log_path: &Path) -> Result<HashMap<String, TouchRecord>> {
+        let mut touches: HashMap<String, TouchRecord> = if !snapshot_path.exists() {
+            HashMap::new()
+        } else {
+            let data = fs::read(snapshot_path)?;
+            if data.is_empty() {
+                HashMap::new()
+            } else {
+                serde_json::from_slice(&data)?
+            }
+        };
+
+        if log_path.exists() {
+            let file = File::open(log_path)?;
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(path) = line.strip_prefix("- ") {
+                    touches.retain(|candidate, _| !path_is_same_or_descendant(candidate, path));
+                    continue;
+                }
+                let record: TouchRecord = serde_json::from_str(&line)?;
+                touches.insert(record.path.clone(), record);
+            }
+        }
+
+        Ok(touches)
+    }
+
+    fn append_touch(&self, record: &TouchRecord) -> Result<()> {
+        storage::ensure_parent_dirs(&self.touches_log_file)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.touches_log_file)?;
+        serde_json::to_writer(&mut file, record)?;
+        writeln!(file)?;
+        Ok(())
+    }
+
+    fn append_touch_removal(&self, rel_path: &str) -> Result<()> {
+        storage::ensure_parent_dirs(&self.touches_log_file)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.touches_log_file)?;
+        writeln!(file, "- {}", rel_path)?;
+        Ok(())
+    }
+
+    fn remove_touch_records_under(&self, rel_path: &str) -> Result<()> {
+        let removed = {
+            let mut touches = self.touches.write();
+            let removed: Vec<_> = touches
+                .iter()
+                .filter(|(path, _)| path_is_same_or_descendant(path, rel_path))
+                .map(|(_, record)| record.clone())
+                .collect();
+            for record in &removed {
+                touches.remove(&record.path);
+            }
+            removed
+        };
+
+        if removed.is_empty() {
+            return Ok(());
+        }
+
+        self.append_touch_removal(rel_path)?;
+        for record in removed {
+            if let Some(key) = record.base_content_key {
+                match fs::remove_file(self.touch_content_path(&key)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn touch_content_path(&self, key: &str) -> PathBuf {
+        self.touch_content_dir.join(key)
+    }
+
+    pub fn get_touch_record(&self, rel_path: &str) -> Option<TouchRecord> {
+        self.touches.read().get(rel_path).cloned()
+    }
+
+    pub fn record_first_touch(
+        &self,
+        rel_path: &str,
+        inherited: Option<&Path>,
+        capture_base_content: bool,
+    ) -> Result<()> {
+        let mut touches = self.touches.write();
+        if touches.contains_key(rel_path) {
+            return Ok(());
+        }
+
+        let base_identity = PathIdentity::from_path(inherited);
+        let mut base_content_key = None;
+        if capture_base_content {
+            if let Some(path) = inherited {
+                if let Some(bytes) = read_bounded_text(path)? {
+                    let key = touch_content_key(rel_path);
+                    let content_path = self.touch_content_path(&key);
+                    storage::ensure_parent_dirs(&content_path)?;
+                    fs::write(&content_path, bytes)?;
+                    base_content_key = Some(key);
+                }
+            }
+        }
+
+        let record = TouchRecord {
+            path: rel_path.to_string(),
+            base_at_first_touch: base_identity,
+            base_content_key,
+        };
+        touches.insert(rel_path.to_string(), record.clone());
+        self.append_touch(&record)
+    }
+
+    pub fn read_touch_base_content(&self, record: &TouchRecord) -> Result<Option<Vec<u8>>> {
+        let Some(key) = &record.base_content_key else {
+            return Ok(None);
+        };
+        let path = self.touch_content_path(key);
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn is_deleted(&self, path: &str) -> bool {
@@ -563,33 +1083,51 @@ impl Branch {
     pub fn add_tombstone(&self, path: &str) -> Result<()> {
         let mut tombstones = self.tombstones.write();
         if tombstones.insert(path.to_string()) {
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&self.tombstones_file)?;
-            writeln!(file, "{}", path)?;
+            self.append_tombstone_op('+', path)?;
         }
         Ok(())
     }
 
-    pub fn remove_tombstone(&self, path: &str) {
+    pub fn remove_tombstone(&self, path: &str) -> Result<()> {
         let mut tombstones = self.tombstones.write();
         if tombstones.remove(path) {
-            let stale = self.tombstone_stale.fetch_add(1, Ordering::Relaxed) + 1;
-            // Compact when stale entries exceed live set size (at least 16 to avoid
-            // thrashing on tiny sets).
-            if stale >= tombstones.len().max(16) as u64
-                && self.rewrite_tombstones(&tombstones).is_ok()
-            {
-                self.tombstone_stale.store(0, Ordering::Relaxed);
-            }
+            self.append_tombstone_op('-', path)?;
         }
+        Ok(())
     }
 
-    /// Rewrite the tombstones file from the in-memory set (caller holds write lock).
+    pub fn remove_tombstones_under(&self, path: &str) -> Result<()> {
+        let removed = {
+            let mut tombstones = self.tombstones.write();
+            let removed: Vec<_> = tombstones
+                .iter()
+                .filter(|candidate| path_is_same_or_descendant(candidate, path))
+                .cloned()
+                .collect();
+            for tombstone in &removed {
+                tombstones.remove(tombstone);
+            }
+            removed
+        };
+
+        for tombstone in removed {
+            self.append_tombstone_op('-', &tombstone)?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the tombstones snapshot from the in-memory set and clear the
+    /// incremental log. This is used by commit/compaction-style paths, not by
+    /// the per-file delete/write hot path.
     fn rewrite_tombstones(&self, tombstones: &HashSet<String>) -> Result<()> {
         let mut file = File::create(&self.tombstones_file)?;
         for t in tombstones {
             writeln!(file, "{}", t)?;
+        }
+        match fs::remove_file(&self.tombstones_log_file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         Ok(())
     }
@@ -603,12 +1141,16 @@ impl Branch {
         let mut tombstones = self.tombstones.write();
         *tombstones = new_tombstones;
         self.rewrite_tombstones(&tombstones)?;
-        self.tombstone_stale.store(0, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn delta_path(&self, rel_path: &str) -> PathBuf {
         self.files_dir.join(rel_path.trim_start_matches('/'))
+    }
+
+    pub fn staging_path(&self) -> PathBuf {
+        self.staging_dir
+            .join(format!("cow-{}.tmp", uuid::Uuid::new_v4()))
     }
 
     pub fn inherited_path(&self, rel_path: &str) -> PathBuf {
@@ -664,6 +1206,9 @@ pub struct BranchManager {
     mount_branches: RwLock<HashMap<PathBuf, String>>,
     /// Storage quota enforcement
     pub quota: StorageQuota,
+    /// Striped path locks serialize same-file COW/delete/write operations
+    /// without allocating one lock per path in large generated trees.
+    path_locks: Vec<Mutex<()>>,
 }
 
 impl BranchManager {
@@ -722,7 +1267,16 @@ impl BranchManager {
             opened_inodes: Mutex::new(HashMap::new()),
             mount_branches: RwLock::new(HashMap::new()),
             quota,
+            path_locks: (0..PATH_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
         })
+    }
+
+    fn path_lock(&self, branch_name: &str, rel_path: &str) -> &Mutex<()> {
+        let mut hasher = DefaultHasher::new();
+        branch_name.hash(&mut hasher);
+        rel_path.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.path_locks.len();
+        &self.path_locks[idx]
     }
 
     /// Register a mount's initial branch (called before FUSE spawn).
@@ -1057,7 +1611,7 @@ impl BranchManager {
             } else {
                 format!("{}/{}", rel_path.trim_end_matches('/'), name)
             };
-            if branch.is_hidden(&child_rel) {
+            if branch.is_hidden(&child_rel) || branch.is_deleted(&child_rel) {
                 continue;
             }
             names.insert(name);
@@ -1180,12 +1734,178 @@ impl BranchManager {
         self.inherited_path_exists_locked(&branches, branch, rel_path)
     }
 
-    fn prune_empty_delta_parents(files_dir: &Path, start: Option<&Path>) {
+    fn resolve_inherited_for_touch_locked(
+        &self,
+        branches: &HashMap<String, Branch>,
+        branch: &Branch,
+        rel_path: &str,
+    ) -> Result<Option<PathBuf>> {
+        if branch.is_hidden(rel_path) {
+            Ok(None)
+        } else {
+            self.inherited_resolve_path_locked(branches, branch, rel_path)
+        }
+    }
+
+    fn record_first_touch_locked(
+        &self,
+        branch: &Branch,
+        rel_path: &str,
+        inherited: Option<&Path>,
+        capture_base_content: bool,
+    ) -> Result<()> {
+        branch.record_first_touch(rel_path, inherited, capture_base_content)
+    }
+
+    pub fn ensure_delta_path_for_write(
+        &self,
+        branch_name: &str,
+        rel_path: &str,
+    ) -> Result<PathBuf> {
+        let _path_guard = self.path_lock(branch_name, rel_path).lock();
+        self.ensure_delta_path_for_write_locked(branch_name, rel_path)
+    }
+
+    fn ensure_delta_path_for_write_locked(
+        &self,
+        branch_name: &str,
+        rel_path: &str,
+    ) -> Result<PathBuf> {
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+
+        if !branch.is_writable() {
+            return Err(BranchError::Invalid(format!(
+                "branch '{}' is frozen/read-only",
+                branch_name
+            )));
+        }
+
+        let delta = branch.delta_path(rel_path);
+        if delta.symlink_metadata().is_err() {
+            let inherited = self.resolve_inherited_for_touch_locked(&branches, branch, rel_path)?;
+            self.record_first_touch_locked(branch, rel_path, inherited.as_deref(), true)?;
+            if let Some(src) = inherited {
+                if let Ok(meta) = src.symlink_metadata() {
+                    if meta.file_type().is_symlink() || meta.file_type().is_file() {
+                        let src_size = meta.len();
+                        self.quota.check(src_size).map_err(|errno| {
+                            BranchError::Io(std::io::Error::from_raw_os_error(errno))
+                        })?;
+                        storage::copy_entry(&src, &delta)?;
+                        self.quota.add(src_size);
+                    }
+                }
+            }
+        }
+
+        branch.remove_tombstone(rel_path)?;
+        storage::ensure_parent_dirs(&delta)?;
+        Ok(delta)
+    }
+
+    pub fn write_data_to_branch(
+        &self,
+        branch_name: &str,
+        rel_path: &str,
+        offset: i64,
+        data: &[u8],
+    ) -> Result<u32> {
+        let offset = u64::try_from(offset).map_err(|_| invalid_offset())?;
+        let write_end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(file_too_large)?;
+
+        let _path_guard = self.path_lock(branch_name, rel_path).lock();
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+
+        if !branch.is_writable() {
+            return Err(BranchError::Invalid(format!(
+                "branch '{}' is frozen/read-only",
+                branch_name
+            )));
+        }
+
+        let delta = branch.delta_path(rel_path);
+        if delta.symlink_metadata().is_err() {
+            let inherited = self.resolve_inherited_for_touch_locked(&branches, branch, rel_path)?;
+            self.record_first_touch_locked(branch, rel_path, inherited.as_deref(), true)?;
+
+            if let Some(src) = inherited {
+                if let Ok(meta) = src.symlink_metadata() {
+                    if meta.file_type().is_file() {
+                        let final_size = meta.len().max(write_end);
+                        self.quota.check(final_size).map_err(|errno| {
+                            BranchError::Io(std::io::Error::from_raw_os_error(errno))
+                        })?;
+                        storage::ensure_parent_dirs(&delta)?;
+                        fs::create_dir_all(&branch.staging_dir)?;
+                        let staging = branch.staging_path();
+                        let result = (|| -> Result<(u32, u64)> {
+                            fs::copy(&src, &staging)?;
+                            let written = write_data_to_file(&staging, offset, data)?;
+                            let final_len = staging.metadata()?.len();
+                            fs::rename(&staging, &delta)?;
+                            Ok((written, final_len))
+                        })();
+                        match result {
+                            Ok((written, final_len)) => {
+                                self.quota.add(final_len);
+                                branch.remove_tombstone(rel_path)?;
+                                return Ok(written);
+                            }
+                            Err(e) => {
+                                let _ = fs::remove_file(&staging);
+                                return Err(e);
+                            }
+                        }
+                    } else if meta.file_type().is_symlink() {
+                        let src_size = meta.len();
+                        self.quota.check(src_size).map_err(|errno| {
+                            BranchError::Io(std::io::Error::from_raw_os_error(errno))
+                        })?;
+                        storage::copy_entry(&src, &delta)?;
+                        self.quota.add(src_size);
+                    }
+                }
+            }
+
+            storage::ensure_parent_dirs(&delta)?;
+        }
+
+        branch.remove_tombstone(rel_path)?;
+        let old_size = delta.metadata().map(|m| m.len()).unwrap_or(0);
+        if write_end > old_size {
+            self.quota
+                .check(write_end - old_size)
+                .map_err(|errno| BranchError::Io(std::io::Error::from_raw_os_error(errno)))?;
+        }
+        let written = write_data_to_file(&delta, offset, data)?;
+        let new_size = delta.metadata().map(|m| m.len()).unwrap_or(old_size);
+        if new_size > old_size {
+            self.quota.add(new_size - old_size);
+        }
+        Ok(written)
+    }
+
+    fn prune_empty_delta_parents(branch: &Branch, start: Option<&Path>) {
         let Some(start) = start else {
             return;
         };
         let mut current = start.to_path_buf();
-        while current.starts_with(files_dir) && current != files_dir {
+        while current.starts_with(&branch.files_dir) && current != branch.files_dir {
+            let rel_path = match current.strip_prefix(&branch.files_dir) {
+                Ok(rel) => format!("/{}", rel.to_string_lossy()),
+                Err(_) => break,
+            };
+            if branch.get_touch_record(&rel_path).is_some() {
+                break;
+            }
             match fs::remove_dir(&current) {
                 Ok(()) => {
                     if let Some(parent) = current.parent() {
@@ -1200,12 +1920,22 @@ impl BranchManager {
     }
 
     pub fn delete_path_in_branch(&self, branch_name: &str, rel_path: &str) -> Result<()> {
+        let _path_guard = self.path_lock(branch_name, rel_path).lock();
         let branches = self.branches.read();
         let branch = branches
             .get(branch_name)
             .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
-        let inherited_exists = self.inherited_path_exists_locked(&branches, branch, rel_path)?;
+        if !branch.is_writable() {
+            return Err(BranchError::Invalid(format!(
+                "branch '{}' is frozen/read-only",
+                branch_name
+            )));
+        }
+
+        let inherited = self.resolve_inherited_for_touch_locked(&branches, branch, rel_path)?;
+        self.record_first_touch_locked(branch, rel_path, inherited.as_deref(), false)?;
+        let inherited_exists = inherited.is_some();
         let delta = branch.delta_path(rel_path);
         if let Ok(meta) = delta.symlink_metadata() {
             let freed = if meta.file_type().is_dir() {
@@ -1215,14 +1945,100 @@ impl BranchManager {
             };
             remove_entry(&delta)?;
             self.quota.sub(freed);
-            Self::prune_empty_delta_parents(&branch.files_dir, delta.parent());
+            Self::prune_empty_delta_parents(branch, delta.parent());
         }
 
         if inherited_exists {
             branch.add_tombstone(rel_path)?;
         } else {
-            branch.remove_tombstone(rel_path);
+            branch.remove_tombstone(rel_path)?;
         }
+        Ok(())
+    }
+
+    pub fn rmdir_path_in_branch(&self, branch_name: &str, rel_path: &str) -> Result<()> {
+        let _path_guard = self.path_lock(branch_name, rel_path).lock();
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+
+        if !branch.is_writable() {
+            return Err(BranchError::Invalid(format!(
+                "branch '{}' is frozen/read-only",
+                branch_name
+            )));
+        }
+
+        let resolved = self
+            .resolve_path_locked(&branches, branch_name, rel_path)?
+            .ok_or_else(|| errno_error(libc::ENOENT))?;
+        let meta = resolved.symlink_metadata()?;
+        if !meta.file_type().is_dir() {
+            return Err(errno_error(libc::ENOTDIR));
+        }
+        if !self
+            .collect_dir_names_locked(&branches, branch_name, rel_path)?
+            .is_empty()
+        {
+            return Err(errno_error(libc::ENOTEMPTY));
+        }
+
+        let inherited = self.resolve_inherited_for_touch_locked(&branches, branch, rel_path)?;
+        self.record_first_touch_locked(branch, rel_path, inherited.as_deref(), false)?;
+        let inherited_exists = inherited.is_some();
+        let delta = branch.delta_path(rel_path);
+        if let Ok(meta) = delta.symlink_metadata() {
+            let freed = if meta.file_type().is_dir() {
+                StorageQuota::dir_size(&delta)
+            } else {
+                meta.len()
+            };
+            remove_entry(&delta)?;
+            self.quota.sub(freed);
+            Self::prune_empty_delta_parents(branch, delta.parent());
+        }
+
+        if inherited_exists {
+            branch.add_tombstone(rel_path)?;
+        } else {
+            branch.remove_tombstone(rel_path)?;
+        }
+        Ok(())
+    }
+
+    pub fn revert_path_in_branch(&self, branch_name: &str, rel_path: &str) -> Result<()> {
+        let rel_path = normalize_branch_rel_path(rel_path)?;
+        let _path_guard = self.path_lock(branch_name, &rel_path).lock();
+        let branches = self.branches.read();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+
+        if !branch.is_writable() {
+            return Err(BranchError::Invalid(format!(
+                "branch '{}' is frozen/read-only",
+                branch_name
+            )));
+        }
+
+        let delta = branch.delta_path(&rel_path);
+        if let Ok(meta) = delta.symlink_metadata() {
+            let freed = if meta.file_type().is_dir() {
+                StorageQuota::dir_size(&delta)
+            } else {
+                meta.len()
+            };
+            remove_entry(&delta)?;
+            self.quota.sub(freed);
+            Self::prune_empty_delta_parents(branch, delta.parent());
+        }
+        branch.remove_tombstones_under(&rel_path)?;
+        branch.remove_touch_records_under(&rel_path)?;
+
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        drop(branches);
+        self.invalidate_branches(&[branch_name.to_string()]);
         Ok(())
     }
 
@@ -1231,6 +2047,14 @@ impl BranchManager {
             .read()
             .get(branch_name)
             .map(|b| b.is_writable())
+            .unwrap_or(false)
+    }
+
+    pub fn branch_has_delta(&self, branch_name: &str, rel_path: &str) -> bool {
+        self.branches
+            .read()
+            .get(branch_name)
+            .map(|b| b.has_delta(rel_path))
             .unwrap_or(false)
     }
 
@@ -1345,6 +2169,11 @@ impl BranchManager {
     /// Commit a leaf branch into its immediate parent.
     /// Returns the parent branch name on success.
     pub fn commit(&self, branch_name: &str) -> Result<String> {
+        Ok(self.commit_with_report(branch_name)?.parent)
+    }
+
+    /// Commit a leaf branch and return machine-readable auto-merge/conflict records.
+    pub fn commit_with_report(&self, branch_name: &str) -> Result<CommitOutcome> {
         let start = Instant::now();
         if branch_name == "main" {
             return Err(BranchError::CannotOperateOnMain);
@@ -1366,51 +2195,138 @@ impl BranchManager {
             .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
         let child_version_at_fork = branch.parent_version_at_fork;
-
-        // First-wins conflict detection: check that the parent hasn't had
-        // another sibling committed since this branch was forked.
-        {
+        let parent_changed = {
             let parent = branches
                 .get(&parent_name)
                 .ok_or_else(|| BranchError::NotFound(parent_name.to_string()))?;
-            let current_parent_version = parent.commit_count.load(Ordering::SeqCst);
-            if current_parent_version != child_version_at_fork {
-                return Err(BranchError::Conflict(branch_name.to_string()));
-            }
-        }
+            parent.commit_count.load(Ordering::SeqCst) != child_version_at_fork
+        };
 
         let child_tombstones = branch.get_tombstones();
         let child_files_dir = branch.files_dir.clone();
+        let branch_dir = self.storage_path.join("branches").join(branch_name);
+        let merge_content_dir = branch_dir.join("merge-content");
+
+        let mut delta_files: Vec<(String, PathBuf)> = Vec::new();
+        self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
+            delta_files.push((rel_path.to_string(), src_path.to_path_buf()));
+            Ok(())
+        })?;
+
+        let mut outcome = CommitOutcome {
+            parent: parent_name.clone(),
+            auto_merges: Vec::new(),
+            conflicts: Vec::new(),
+        };
+        let mut merge_sources: HashMap<String, PathBuf> = HashMap::new();
+
+        if parent_changed {
+            for path in &child_tombstones {
+                let record = branch
+                    .get_touch_record(path)
+                    .unwrap_or_else(|| TouchRecord {
+                        path: path.clone(),
+                        base_at_first_touch: PathIdentity::missing(),
+                        base_content_key: None,
+                    });
+                let current_parent_path = if branch.is_hidden(path) {
+                    None
+                } else {
+                    self.inherited_resolve_path_locked(&branches, branch, path)?
+                };
+                let current_identity = PathIdentity::from_path(current_parent_path.as_deref());
+                if record.base_at_first_touch != current_identity {
+                    outcome.conflicts.push(CommitConflict {
+                        path: path.clone(),
+                        session_action: "delete".to_string(),
+                        resolution: "session_won".to_string(),
+                        reason: "parent_changed_after_first_touch".to_string(),
+                        base_at_first_touch: record.base_at_first_touch,
+                        base_at_commit: current_identity,
+                    });
+                }
+            }
+
+            for (rel_path, src_path) in &delta_files {
+                let record = branch
+                    .get_touch_record(rel_path)
+                    .unwrap_or_else(|| TouchRecord {
+                        path: rel_path.clone(),
+                        base_at_first_touch: PathIdentity::missing(),
+                        base_content_key: None,
+                    });
+                let current_parent_path = if branch.is_hidden(rel_path) {
+                    None
+                } else {
+                    self.inherited_resolve_path_locked(&branches, branch, rel_path)?
+                };
+                let current_identity = PathIdentity::from_path(current_parent_path.as_deref());
+                if record.base_at_first_touch == current_identity {
+                    continue;
+                }
+
+                let mut merged_cleanly = false;
+                if record.base_at_first_touch.kind == "file" && current_identity.kind == "file" {
+                    if let (Some(base_bytes), Some(current_path), Some(session_bytes)) = (
+                        branch.read_touch_base_content(&record)?,
+                        current_parent_path.as_ref(),
+                        read_bounded_text(src_path)?,
+                    ) {
+                        if let Some(current_bytes) = read_bounded_text(current_path)? {
+                            if let Some(merged) = try_three_way_text_merge(
+                                &base_bytes,
+                                &current_bytes,
+                                &session_bytes,
+                            ) {
+                                let key = touch_content_key(rel_path);
+                                let merged_path = merge_content_dir.join(key);
+                                storage::ensure_parent_dirs(&merged_path)?;
+                                fs::write(&merged_path, merged)?;
+                                merge_sources.insert(rel_path.clone(), merged_path);
+                                outcome.auto_merges.push(CommitAutoMerge {
+                                    path: rel_path.clone(),
+                                    resolution: "clean_text_merge".to_string(),
+                                });
+                                merged_cleanly = true;
+                            }
+                        }
+                    }
+                }
+
+                if !merged_cleanly {
+                    let action = if record.base_at_first_touch.exists {
+                        "modify"
+                    } else {
+                        "create"
+                    };
+                    outcome.conflicts.push(CommitConflict {
+                        path: rel_path.clone(),
+                        session_action: action.to_string(),
+                        resolution: "session_won".to_string(),
+                        reason: "parent_changed_after_first_touch".to_string(),
+                        base_at_first_touch: record.base_at_first_touch,
+                        base_at_commit: current_identity,
+                    });
+                }
+            }
+        }
 
         if parent_name == "main" {
             // Direct child of main: apply to the base filesystem atomically.
-            //
-            // Phase 1 (rollback-able): stage tombstone deletions (rename the
-            // base entries aside) and copy every delta file to a temp sibling.
-            // Deletions are staged before copies so a path whose type changed
-            // (e.g. a directory replaced by a file) is cleared before its
-            // replacement is staged. No base data is destroyed yet: any error
-            // here propagates, `staged` is dropped (temps removed, trashed
-            // entries restored), and the branch + its delta are preserved for
-            // retry or abort — never a false success or a partial mutation.
             let mut staged = StagedMerge::new();
             for path in &child_tombstones {
                 let full_path = self.base_path.join(path.trim_start_matches('/'));
                 staged.stage_delete(&full_path)?;
             }
-            self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
-                staged.stage_copy(rel_path, src_path, &self.base_path)
-            })?;
+            for (rel_path, src_path) in &delta_files {
+                let source = merge_sources.get(rel_path).unwrap_or(src_path);
+                staged.stage_copy(rel_path, source, &self.base_path)?;
+            }
 
-            // Phase 2 (near-infallible): publish the copies and discard the
-            // trashed deletions.
             let total_bytes = staged.bytes;
             let committed_paths = staged.commit()?;
             let num_files = committed_paths.len() as u64;
 
-            // Remove main's delta for committed/tombstoned paths so base
-            // takes precedence.  Without this, main's pre-existing delta
-            // (written before branching) would overshadow the updated base.
             if let Some(main_branch) = branches.get("main") {
                 let main_files_dir = &main_branch.files_dir;
                 for rel_path in committed_paths.iter().chain(&child_tombstones) {
@@ -1419,13 +2335,11 @@ impl BranchManager {
                 }
             }
 
-            // Increment parent's commit_count (first-wins bookkeeping)
             if let Some(main_branch) = branches.get("main") {
                 main_branch.commit_count.fetch_add(1, Ordering::SeqCst);
                 main_branch.write_metadata()?;
             }
 
-            // Remove branch
             branches.remove(branch_name);
             let branch_dir = self.storage_path.join("branches").join(branch_name);
             if branch_dir.exists() {
@@ -1439,57 +2353,64 @@ impl BranchManager {
 
             let elapsed = start.elapsed();
             log::debug!(
-                "[BENCH] commit '{}' to base: {:?} ({} us), {} deletions, {} files, {} bytes",
+                "[BENCH] commit '{}' to base: {:?} ({} us), {} deletions, {} files, {} bytes, {} auto-merges, {} conflicts",
                 branch_name,
                 elapsed,
                 elapsed.as_micros(),
                 child_tombstones.len(),
                 num_files,
-                total_bytes
+                total_bytes,
+                outcome.auto_merges.len(),
+                outcome.conflicts.len()
             );
         } else {
-            // Nested branch: merge delta into parent's delta
+            // Nested branch: merge delta into parent's delta.
             let parent = branches
                 .get(&parent_name)
                 .ok_or_else(|| BranchError::NotFound(parent_name.to_string()))?;
 
             let parent_files_dir = parent.files_dir.clone();
             let mut parent_tombstones = parent.get_tombstones();
+            let mut deleted_parent_delta_parents = Vec::new();
 
-            // Phase 1 (rollback-able): stage the merge into the parent's delta
-            // directory. For each child tombstone, stage the deletion of any
-            // matching parent-delta entry (renamed aside) and record the
-            // tombstone; then copy every child delta file to a temp sibling.
-            // Deletions are staged before copies so a type change at a path
-            // (e.g. a directory replaced by a file) is cleared first. Any error
-            // here drops `staged`, restoring the parent's delta untouched.
             let mut staged = StagedMerge::new();
             for tombstone in &child_tombstones {
                 let parent_delta = parent_files_dir.join(tombstone.trim_start_matches('/'));
+                let deleted_parent_delta_parent = parent_delta
+                    .symlink_metadata()
+                    .is_ok()
+                    .then(|| parent_delta.parent().map(Path::to_path_buf))
+                    .flatten();
+                let parent_inherited_exists =
+                    self.inherited_path_exists_locked(&branches, parent, tombstone)?;
                 staged.stage_delete(&parent_delta)?;
-                parent_tombstones.insert(tombstone.clone());
+                if let Some(parent_dir) = deleted_parent_delta_parent {
+                    deleted_parent_delta_parents.push(parent_dir);
+                }
+                if parent_inherited_exists {
+                    parent_tombstones.insert(tombstone.clone());
+                } else {
+                    parent_tombstones.remove(tombstone);
+                }
             }
-            self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
-                staged.stage_copy(rel_path, src_path, &parent_files_dir)
-            })?;
+            for (rel_path, src_path) in &delta_files {
+                let source = merge_sources.get(rel_path).unwrap_or(src_path);
+                staged.stage_copy(rel_path, source, &parent_files_dir)?;
+            }
 
-            // Phase 2 (near-infallible): publish the copies into the parent's
-            // delta directory and discard the trashed deletions.
             let copied_paths = staged.commit()?;
+            for parent_dir in deleted_parent_delta_parents {
+                Self::prune_empty_delta_parents(parent, Some(&parent_dir));
+            }
 
-            // A path that now has a delta file is no longer deleted.
             for path in &copied_paths {
                 parent_tombstones.remove(path);
             }
 
-            // Write updated tombstones to parent
             parent.set_tombstones(parent_tombstones)?;
-
-            // Increment parent's commit_count (first-wins bookkeeping)
             parent.commit_count.fetch_add(1, Ordering::SeqCst);
             parent.write_metadata()?;
 
-            // Remove child branch
             branches.remove(branch_name);
             let branch_dir = self.storage_path.join("branches").join(branch_name);
             if branch_dir.exists() {
@@ -1504,15 +2425,17 @@ impl BranchManager {
 
             let elapsed = start.elapsed();
             log::debug!(
-                "[BENCH] commit '{}' into parent '{}': {:?} ({} us)",
+                "[BENCH] commit '{}' into parent '{}': {:?} ({} us), {} auto-merges, {} conflicts",
                 branch_name,
                 parent_name,
                 elapsed,
                 elapsed.as_micros(),
+                outcome.auto_merges.len(),
+                outcome.conflicts.len(),
             );
         }
 
-        Ok(parent_name)
+        Ok(outcome)
     }
 
     /// Abort a leaf branch, discarding only that branch.
@@ -1602,6 +2525,8 @@ mod branch_manager_tests {
     use super::{BranchManager, BranchState, InheritanceMode};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::thread;
 
     #[cfg(unix)]
     struct ModeReset(Vec<PathBuf>);
@@ -1664,6 +2589,584 @@ mod branch_manager_tests {
         BranchManager::new(storage, base, work, None).unwrap()
     }
 
+    fn write_delta(mgr: &BranchManager, branch: &str, rel_path: &str, data: &[u8]) {
+        let delta = mgr.ensure_delta_path_for_write(branch, rel_path).unwrap();
+        write(&delta, data);
+    }
+
+    fn mkdir_delta(mgr: &BranchManager, branch: &str, rel_path: &str) {
+        let delta = mgr.ensure_delta_path_for_write(branch, rel_path).unwrap();
+        fs::create_dir_all(delta).unwrap();
+    }
+
+    #[test]
+    fn deleting_child_directory_keeps_explicit_empty_delta_parents() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        mkdir_delta(&mgr, "work", "/fake-nfs");
+        mkdir_delta(&mgr, "work", "/fake-nfs/nfs-session");
+        mkdir_delta(&mgr, "work", "/fake-nfs/nfs-session/.ccc-storage");
+
+        mgr.delete_path_in_branch("work", "/fake-nfs/nfs-session/.ccc-storage")
+            .unwrap();
+
+        assert!(
+            tmp.path()
+                .join("storage/branches/work/files/fake-nfs/nfs-session")
+                .is_dir(),
+            "deleting the child directory must not prune its explicitly created parent"
+        );
+        assert!(
+            mgr.resolve_path("work", "/fake-nfs/nfs-session")
+                .unwrap()
+                .is_some(),
+            "explicit empty parent should remain visible in the branch view"
+        );
+    }
+
+    #[test]
+    fn deleting_file_still_prunes_untouched_structural_delta_parents() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        write_delta(&mgr, "work", "/structural/only/file.txt", b"payload");
+
+        mgr.delete_path_in_branch("work", "/structural/only/file.txt")
+            .unwrap();
+
+        assert!(
+            !tmp.path()
+                .join("storage/branches/work/files/structural")
+                .exists(),
+            "purely structural delta parent dirs should still be cleaned up"
+        );
+    }
+
+    #[test]
+    fn rmdir_refuses_non_empty_inherited_directory_without_hiding_it() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(
+            &tmp.path()
+                .join("base/.scratch/fake-nfs/nfs-session/.ccc-storage/events/log"),
+            b"event\n",
+        );
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        let result = mgr.rmdir_path_in_branch("work", "/.scratch/fake-nfs");
+
+        assert!(result.is_err(), "rmdir of a non-empty directory must fail");
+        assert!(
+            mgr.resolve_path("work", "/.scratch/fake-nfs")
+                .unwrap()
+                .is_some(),
+            "failed rmdir must not tombstone or hide the directory being traversed"
+        );
+        assert!(
+            mgr.collect_dir_names("work", "/.scratch/fake-nfs")
+                .unwrap()
+                .contains("nfs-session"),
+            "failed rmdir must leave inherited children visible"
+        );
+    }
+
+    #[test]
+    fn rmdir_removes_empty_inherited_directory_after_children_are_deleted() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        fs::create_dir_all(tmp.path().join("base/.scratch/fake-nfs/nfs-session")).unwrap();
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        mgr.rmdir_path_in_branch("work", "/.scratch/fake-nfs/nfs-session")
+            .unwrap();
+
+        assert!(
+            mgr.resolve_path("work", "/.scratch/fake-nfs/nfs-session")
+                .unwrap()
+                .is_none(),
+            "empty inherited directory should be tombstoned after rmdir"
+        );
+    }
+
+    #[test]
+    fn rmdir_removes_inherited_directory_after_all_children_are_tombstoned() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/subdir/nested.txt"), b"nested\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        mgr.delete_path_in_branch("work", "/subdir/nested.txt")
+            .unwrap();
+
+        assert!(
+            mgr.collect_dir_names("work", "/subdir").unwrap().is_empty(),
+            "tombstoned inherited children should not keep the directory non-empty"
+        );
+        mgr.rmdir_path_in_branch("work", "/subdir").unwrap();
+        assert!(
+            mgr.resolve_path("work", "/subdir").unwrap().is_none(),
+            "inherited directory should be removed once every visible child is gone"
+        );
+    }
+
+    #[test]
+    fn legacy_touch_and_tombstone_snapshots_migrate_to_incremental_logs_on_load() {
+        let tmp = TmpDir::new();
+        let base = tmp.path().join("base");
+        let storage = tmp.path().join("storage");
+        let work = tmp.path().join("work");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&work).unwrap();
+
+        let mgr = BranchManager::new(storage.clone(), base.clone(), work.clone(), None).unwrap();
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        drop(mgr);
+
+        let branch_dir = storage.join("branches/work");
+        let touches_file = branch_dir.join("touches.json");
+        let touches_log = branch_dir.join("touches.log");
+        let tombstones_file = branch_dir.join("tombstones");
+        let tombstones_log = branch_dir.join("tombstones.log");
+        let legacy_touch = serde_json::json!({
+            "/legacy-touch": {
+                "path": "/legacy-touch",
+                "base_at_first_touch": {
+                    "exists": false,
+                    "kind": "missing",
+                    "bytes": 0,
+                    "mtime_ns": null
+                }
+            }
+        });
+        fs::write(
+            &touches_file,
+            serde_json::to_vec_pretty(&legacy_touch).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &tombstones_file,
+            "/legacy-delete\n/removed-before-migration\n",
+        )
+        .unwrap();
+        fs::write(
+            &tombstones_log,
+            "- /removed-before-migration\n+ /already-logged\n",
+        )
+        .unwrap();
+        let _ = fs::remove_file(&touches_log);
+
+        let migrated = BranchManager::new(storage.clone(), base, work, None).unwrap();
+        let branches = migrated.branches.read();
+        let branch = branches.get("work").unwrap();
+        assert!(branch.get_touch_record("/legacy-touch").is_some());
+        assert!(branch.is_deleted("/legacy-delete"));
+        assert!(!branch.is_deleted("/removed-before-migration"));
+        assert!(branch.is_deleted("/already-logged"));
+        drop(branches);
+
+        let touch_log_text = fs::read_to_string(&touches_log).unwrap();
+        assert!(touch_log_text.contains("/legacy-touch"));
+        let tombstone_log_text = fs::read_to_string(&tombstones_log).unwrap();
+        assert!(
+            tombstone_log_text.starts_with("+ /legacy-delete\n+ /removed-before-migration\n"),
+            "legacy tombstone snapshot should be prepended before existing log ops"
+        );
+        assert!(tombstone_log_text.contains("- /removed-before-migration"));
+        assert_eq!(fs::read_to_string(&tombstones_file).unwrap(), "");
+        assert_eq!(fs::read_to_string(&touches_file).unwrap(), "{}\n");
+    }
+
+    #[test]
+    fn first_touch_appends_incrementally_after_migrating_legacy_snapshot() {
+        let tmp = TmpDir::new();
+        let base = tmp.path().join("base");
+        let storage = tmp.path().join("storage");
+        let work = tmp.path().join("work");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&work).unwrap();
+
+        let mgr = BranchManager::new(storage.clone(), base.clone(), work.clone(), None).unwrap();
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        drop(mgr);
+
+        // Simulate an existing large legacy touches.json snapshot from an old
+        // session. First load migrates it into touches.log and clears the
+        // legacy snapshot so future launches do not parse a multi-MB JSON map.
+        // Recording one more first-touch must append to the log without
+        // re-growing touches.json.
+        let touches_file = storage.join("branches/work/touches.json");
+        let legacy_snapshot = serde_json::json!({
+            "/already-touched": {
+                "path": "/already-touched",
+                "base_at_first_touch": {
+                    "exists": false,
+                    "kind": "missing",
+                    "bytes": 0,
+                    "mtime_ns": null
+                }
+            }
+        });
+        fs::write(
+            &touches_file,
+            serde_json::to_vec_pretty(&legacy_snapshot).unwrap(),
+        )
+        .unwrap();
+
+        fs::create_dir_all(base.join("empty-old-scratch/.ccc-storage")).unwrap();
+        let mgr = BranchManager::new(storage.clone(), base, work, None).unwrap();
+        mgr.delete_path_in_branch("work", "/empty-old-scratch")
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&touches_file).unwrap(),
+            "{}\n",
+            "legacy touches.json should stay compact after migration and first-touch append"
+        );
+
+        let touches_log = storage.join("branches/work/touches.log");
+        let log = fs::read_to_string(&touches_log).expect("touches.log should be appended");
+        assert!(
+            log.contains("/already-touched"),
+            "incremental touch log should contain migrated legacy touch"
+        );
+        assert!(
+            log.contains("/empty-old-scratch"),
+            "incremental touch log should contain the newly deleted directory"
+        );
+
+        let reloaded = BranchManager::new(
+            storage,
+            tmp.path().join("base"),
+            tmp.path().join("work"),
+            None,
+        )
+        .unwrap();
+        let branches = reloaded.branches.read();
+        let branch = branches.get("work").unwrap();
+        assert!(
+            branch.get_touch_record("/already-touched").is_some(),
+            "legacy snapshot touch should still load"
+        );
+        assert!(
+            branch.get_touch_record("/empty-old-scratch").is_some(),
+            "incremental log touch should load on daemon restart"
+        );
+    }
+
+    #[test]
+    fn tombstone_removal_appends_incrementally_after_migrating_legacy_snapshot() {
+        let tmp = TmpDir::new();
+        let base = tmp.path().join("base");
+        let storage = tmp.path().join("storage");
+        let work = tmp.path().join("work");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&work).unwrap();
+
+        let mgr = BranchManager::new(storage.clone(), base.clone(), work.clone(), None).unwrap();
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        drop(mgr);
+
+        let tombstones_file = storage.join("branches/work/tombstones");
+        fs::write(
+            &tombstones_file,
+            "/old-empty-scratch\n/old-empty-scratch/.ccc-storage\n",
+        )
+        .unwrap();
+
+        let mgr = BranchManager::new(storage.clone(), base, work, None).unwrap();
+        // The inherited path is gone, so this delete is effectively clearing
+        // stale BranchFS overlay state. First load migrates the old snapshot
+        // into tombstones.log; the removal must append there and keep the
+        // legacy tombstones file compact.
+        mgr.delete_path_in_branch("work", "/old-empty-scratch")
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&tombstones_file).unwrap(),
+            "",
+            "legacy tombstones file should stay compact after migration and removal"
+        );
+
+        let tombstones_log = storage.join("branches/work/tombstones.log");
+        let log = fs::read_to_string(&tombstones_log).expect("tombstones.log should be appended");
+        assert!(
+            log.contains("+ /old-empty-scratch\n"),
+            "incremental tombstone log should contain migrated legacy tombstone"
+        );
+        assert!(
+            log.contains("- /old-empty-scratch"),
+            "incremental tombstone log should record the removal"
+        );
+
+        let reloaded = BranchManager::new(
+            storage,
+            tmp.path().join("base"),
+            tmp.path().join("work"),
+            None,
+        )
+        .unwrap();
+        let branches = reloaded.branches.read();
+        let branch = branches.get("work").unwrap();
+        assert!(
+            !branch.is_deleted("/old-empty-scratch"),
+            "incremental tombstone removal should load on daemon restart"
+        );
+        assert!(
+            branch.is_deleted("/old-empty-scratch/.ccc-storage"),
+            "unrelated descendant tombstone should remain"
+        );
+    }
+
+    #[test]
+    fn delete_first_touch_does_not_copy_inherited_text_content() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/file.txt"), b"base text\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        mgr.delete_path_in_branch("work", "/file.txt").unwrap();
+
+        let branches = mgr.branches.read();
+        let branch = branches.get("work").unwrap();
+        let record = branch
+            .get_touch_record("/file.txt")
+            .expect("delete should record first touch identity");
+        assert!(
+            record.base_content_key.is_none(),
+            "delete touches should not read/copy inherited text contents"
+        );
+    }
+
+    #[test]
+    fn write_first_touch_keeps_inherited_text_content_for_merge() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/file.txt"), b"base text\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        write_delta(&mgr, "work", "/file.txt", b"changed\n");
+
+        let branches = mgr.branches.read();
+        let branch = branches.get("work").unwrap();
+        let record = branch
+            .get_touch_record("/file.txt")
+            .expect("write should record first touch identity");
+        assert!(
+            record.base_content_key.is_some(),
+            "write touches should keep inherited text contents for 3-way merge"
+        );
+    }
+
+    #[test]
+    fn cow_write_to_inherited_file_preserves_unwritten_ranges() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/file.txt"), b"0123456789");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        let written = mgr
+            .write_data_to_branch("work", "/file.txt", 3, b"ABC")
+            .unwrap();
+
+        assert_eq!(written, 3);
+        let delta = tmp.path().join("storage/branches/work/files/file.txt");
+        assert_eq!(fs::read(&delta).unwrap(), b"012ABC6789");
+    }
+
+    #[test]
+    fn concurrent_cow_writes_to_same_inherited_file_preserve_both_writes() {
+        let tmp = TmpDir::new();
+        let mgr = Arc::new(manager(&tmp));
+        write(&tmp.path().join("base/file.txt"), b"0123456789");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        let a = mgr.clone();
+        let t1 = thread::spawn(move || a.write_data_to_branch("work", "/file.txt", 0, b"AA"));
+        let b = mgr.clone();
+        let t2 = thread::spawn(move || b.write_data_to_branch("work", "/file.txt", 8, b"BB"));
+
+        assert_eq!(t1.join().unwrap().unwrap(), 2);
+        assert_eq!(t2.join().unwrap().unwrap(), 2);
+        let delta = tmp.path().join("storage/branches/work/files/file.txt");
+        assert_eq!(fs::read(&delta).unwrap(), b"AA234567BB");
+    }
+
+    #[test]
+    fn sibling_disjoint_commits_do_not_conflict_after_parent_version_changes() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        mgr.create_branch_with_mode("a", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.create_branch_with_mode("b", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        write_delta(&mgr, "a", "/a.txt", b"a\n");
+        write_delta(&mgr, "b", "/b.txt", b"b\n");
+
+        let b_outcome = mgr.commit_with_report("b").unwrap();
+        assert!(
+            b_outcome.conflicts.is_empty(),
+            "unexpected b conflicts: {:?}",
+            b_outcome.conflicts
+        );
+        assert!(
+            b_outcome.auto_merges.is_empty(),
+            "unexpected b auto-merges: {:?}",
+            b_outcome.auto_merges
+        );
+
+        let a_outcome = mgr.commit_with_report("a").unwrap();
+        assert!(
+            a_outcome.conflicts.is_empty(),
+            "disjoint commit should not conflict: {:?}",
+            a_outcome.conflicts
+        );
+        assert!(
+            a_outcome.auto_merges.is_empty(),
+            "disjoint commit should not auto-merge: {:?}",
+            a_outcome.auto_merges
+        );
+        assert_eq!(fs::read(tmp.path().join("base/a.txt")).unwrap(), b"a\n");
+        assert_eq!(fs::read(tmp.path().join("base/b.txt")).unwrap(), b"b\n");
+    }
+
+    #[test]
+    fn sibling_same_text_file_non_overlapping_edits_auto_merge_cleanly() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(
+            &tmp.path().join("base/file.txt"),
+            b"line1\nbase-a\nline3\nbase-b\nline5\n",
+        );
+        mgr.create_branch_with_mode("a", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.create_branch_with_mode("b", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        write_delta(
+            &mgr,
+            "a",
+            "/file.txt",
+            b"line1\nA-a\nline3\nbase-b\nline5\n",
+        );
+        write_delta(
+            &mgr,
+            "b",
+            "/file.txt",
+            b"line1\nbase-a\nline3\nB-b\nline5\n",
+        );
+
+        mgr.commit_with_report("b").unwrap();
+        let a_outcome = mgr.commit_with_report("a").unwrap();
+
+        assert!(
+            a_outcome.conflicts.is_empty(),
+            "clean merge should not be a conflict: {:?}",
+            a_outcome.conflicts
+        );
+        assert_eq!(
+            a_outcome.auto_merges.len(),
+            1,
+            "expected one auto-merge: {:?}",
+            a_outcome.auto_merges
+        );
+        assert_eq!(a_outcome.auto_merges[0].path, "/file.txt");
+        assert_eq!(
+            fs::read(tmp.path().join("base/file.txt")).unwrap(),
+            b"line1\nA-a\nline3\nB-b\nline5\n"
+        );
+    }
+
+    #[test]
+    fn sibling_same_text_file_overlapping_edits_report_conflict_but_latest_wins() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/file.txt"), b"one\nbase\nthree\n");
+        mgr.create_branch_with_mode("a", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.create_branch_with_mode("b", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        write_delta(&mgr, "a", "/file.txt", b"one\nA\nthree\n");
+        write_delta(&mgr, "b", "/file.txt", b"one\nB\nthree\n");
+
+        mgr.commit_with_report("b").unwrap();
+        let a_outcome = mgr.commit_with_report("a").unwrap();
+
+        assert_eq!(
+            a_outcome.conflicts.len(),
+            1,
+            "expected one conflict: {:?}",
+            a_outcome.conflicts
+        );
+        assert_eq!(a_outcome.conflicts[0].path, "/file.txt");
+        assert_eq!(a_outcome.conflicts[0].resolution, "session_won");
+        assert_eq!(
+            fs::read(tmp.path().join("base/file.txt")).unwrap(),
+            b"one\nA\nthree\n"
+        );
+    }
+
+    #[test]
+    fn sibling_delete_vs_modify_reports_conflict_but_latest_delete_wins() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/file.txt"), b"base\n");
+        mgr.create_branch_with_mode("a", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.create_branch_with_mode("b", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        mgr.delete_path_in_branch("a", "/file.txt").unwrap();
+        write_delta(&mgr, "b", "/file.txt", b"b\n");
+
+        mgr.commit_with_report("b").unwrap();
+        let a_outcome = mgr.commit_with_report("a").unwrap();
+
+        assert_eq!(
+            a_outcome.conflicts.len(),
+            1,
+            "expected one conflict: {:?}",
+            a_outcome.conflicts
+        );
+        assert_eq!(a_outcome.conflicts[0].path, "/file.txt");
+        assert_eq!(a_outcome.conflicts[0].session_action, "delete");
+        assert!(!tmp.path().join("base/file.txt").exists());
+    }
+
+    #[test]
+    fn running_branch_delta_survives_foreign_same_path_commit() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/file.txt"), b"base\n");
+        mgr.create_branch_with_mode("a", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.create_branch_with_mode("b", "main", InheritanceMode::Lazy)
+            .unwrap();
+
+        write_delta(&mgr, "a", "/file.txt", b"a\n");
+        write_delta(&mgr, "b", "/file.txt", b"b\n");
+        mgr.commit_with_report("b").unwrap();
+
+        let resolved = mgr.resolve_path("a", "/file.txt").unwrap().unwrap();
+        assert_eq!(fs::read(resolved).unwrap(), b"a\n");
+    }
+
     #[test]
     fn lazy_branch_resolves_base_without_inherited_snapshot_and_prefers_delta() {
         let tmp = TmpDir::new();
@@ -1693,6 +3196,134 @@ mod branch_manager_tests {
 
         let resolved = mgr.resolve_path("lazy", "/dir/base.txt").unwrap().unwrap();
         assert_eq!(fs::read(&resolved).unwrap(), b"delta");
+    }
+
+    #[test]
+    fn removed_tombstone_does_not_reappear_after_manager_reload() {
+        let tmp = TmpDir::new();
+        write(&tmp.path().join("base/existing.txt"), b"base");
+
+        {
+            let mgr = manager(&tmp);
+            mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+                .unwrap();
+            mgr.with_branch("work", |branch| {
+                // Delete followed by rewrite leaves a delta at the same path;
+                // the old tombstone is only an implementation detail and must
+                // not survive daemon/manager reload through the on-disk store.
+                branch.add_tombstone("/existing.txt")?;
+                branch.remove_tombstone("/existing.txt")?;
+                write(&branch.delta_path("/existing.txt"), b"rewritten");
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        let mgr = manager(&tmp);
+        let status = mgr.branch_status("work").unwrap();
+        assert!(
+            status
+                .diff
+                .iter()
+                .any(|entry| entry.op == "delta" && entry.path == "/existing.txt"),
+            "rewritten file delta missing from status: {:?}",
+            status.diff
+        );
+        assert!(
+            !status
+                .diff
+                .iter()
+                .any(|entry| entry.op == "delete" && entry.path == "/existing.txt"),
+            "stale tombstone came back after reload: {:?}",
+            status.diff
+        );
+    }
+
+    #[test]
+    fn revert_path_drops_added_file_delta() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        write_delta(&mgr, "work", "/scratch/current_date.txt", b"2026-07-07\n");
+
+        mgr.revert_path_in_branch("work", "/scratch/current_date.txt")
+            .unwrap();
+
+        assert!(
+            mgr.resolve_path("work", "/scratch/current_date.txt")
+                .unwrap()
+                .is_none(),
+            "added branch-only file should disappear after revert"
+        );
+        assert!(
+            mgr.branch_status("work").unwrap().diff.is_empty(),
+            "reverted added file should not remain in status"
+        );
+    }
+
+    #[test]
+    fn revert_path_restores_inherited_file_after_modification() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/config.txt"), b"base\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.write_data_to_branch("work", "/config.txt", 0, b"branch\n")
+            .unwrap();
+
+        mgr.revert_path_in_branch("work", "/config.txt").unwrap();
+
+        let resolved = mgr.resolve_path("work", "/config.txt").unwrap().unwrap();
+        assert_eq!(fs::read(resolved).unwrap(), b"base\n");
+        assert!(mgr.branch_status("work").unwrap().diff.is_empty());
+        let branches = mgr.branches.read();
+        let branch = branches.get("work").unwrap();
+        assert!(
+            branch.get_touch_record("/config.txt").is_none(),
+            "discarded changes should not leave stale first-touch records"
+        );
+    }
+
+    #[test]
+    fn revert_path_removes_tombstone_and_restores_inherited_file() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/old.txt"), b"old\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.delete_path_in_branch("work", "/old.txt").unwrap();
+        assert!(mgr.resolve_path("work", "/old.txt").unwrap().is_none());
+
+        mgr.revert_path_in_branch("work", "/old.txt").unwrap();
+
+        let resolved = mgr.resolve_path("work", "/old.txt").unwrap().unwrap();
+        assert_eq!(fs::read(resolved).unwrap(), b"old\n");
+        assert!(mgr.branch_status("work").unwrap().diff.is_empty());
+    }
+
+    #[test]
+    fn revert_path_drops_directory_tombstone_and_delta_descendants() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+        write(&tmp.path().join("base/dir/base.txt"), b"base\n");
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        mgr.with_branch("work", |branch| {
+            branch.add_tombstone("/dir")?;
+            write(&branch.delta_path("/dir/new.txt"), b"new\n");
+            Ok(())
+        })
+        .unwrap();
+        assert!(mgr.resolve_path("work", "/dir/base.txt").unwrap().is_none());
+        assert!(mgr.resolve_path("work", "/dir/new.txt").unwrap().is_some());
+
+        mgr.revert_path_in_branch("work", "/dir").unwrap();
+
+        let base_child = mgr.resolve_path("work", "/dir/base.txt").unwrap().unwrap();
+        assert_eq!(fs::read(base_child).unwrap(), b"base\n");
+        assert!(mgr.resolve_path("work", "/dir/new.txt").unwrap().is_none());
+        assert!(mgr.branch_status("work").unwrap().diff.is_empty());
     }
 
     #[test]
@@ -1918,6 +3549,42 @@ mod branch_manager_tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn nested_delete_of_parent_created_file_leaves_no_parent_tombstone() {
+        let tmp = TmpDir::new();
+        let mgr = manager(&tmp);
+
+        mgr.create_branch_with_mode("work", "main", InheritanceMode::Lazy)
+            .unwrap();
+        write_delta(&mgr, "work", "/tmp/session-only.tmp", b"transient");
+        mgr.create_branch_with_mode("child", "work", InheritanceMode::Lazy)
+            .unwrap();
+
+        mgr.delete_path_in_branch("child", "/tmp/session-only.tmp")
+            .unwrap();
+        let child_status = mgr.branch_status("child").unwrap();
+        assert_eq!(child_status.tombstones, 1);
+
+        assert_eq!(mgr.commit("child").unwrap(), "work");
+
+        let parent_status = mgr.branch_status("work").unwrap();
+        assert!(
+            parent_status.diff.is_empty(),
+            "nested create/delete should collapse to no-op, got {:?}",
+            parent_status.diff
+        );
+        mgr.with_branch("work", |branch| {
+            assert!(!branch.delta_path("/tmp/session-only.tmp").exists());
+            assert!(!branch.delta_path("/tmp").exists());
+            assert!(branch.get_tombstones().is_empty());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(mgr.commit("work").unwrap(), "main");
+        assert!(!tmp.path().join("base/tmp/session-only.tmp").exists());
     }
 
     #[test]

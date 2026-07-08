@@ -4,12 +4,13 @@
 //! Run with: cargo test --test test_integration -- --ignored
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs as unix_fs;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Helper: CREATE a branch. Returns the new branch name.
 unsafe fn ioctl_create(fd: i32) -> Result<String, i32> {
@@ -196,6 +197,149 @@ impl Drop for TestFixture {
         let _ = fs::remove_dir_all(&self.base);
         let _ = fs::remove_dir_all(&self.storage);
         let _ = fs::remove_dir_all(&self.mnt);
+    }
+}
+
+fn run_command_with_timeout(cmd: &mut Command, timeout: Duration, label: &str) {
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {}: {}", label, e));
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "{} exited with {}", label, status);
+                return;
+            }
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{} did not finish within {:?}", label, timeout);
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(e) => panic!("wait for {}: {}", label, e),
+        }
+    }
+}
+
+// ── Responsiveness regression tests ──────────────────────────────────
+
+#[test]
+#[ignore]
+fn test_statfs_responsive_while_deleting_large_scratch_tree() {
+    let fix = TestFixture::new("statfs_rm_scratch");
+    fix.mount();
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    // Shape mirrors old CCC storage test artifacts: a .scratch tree with
+    // nested .ccc-storage metadata. This used to produce thousands of BranchFS
+    // touch/tombstone records; later deleting even an apparently empty ancestor
+    // could block the fuser request loop long enough for `df -h` to hang.
+    let scratch = bdir.join(".scratch");
+    for dir_idx in 0..50 {
+        let dir = scratch
+            .join("ccc-storage")
+            .join(format!("case-{}", dir_idx))
+            .join(".ccc-storage");
+        fs::create_dir_all(&dir).unwrap();
+        for file_idx in 0..100 {
+            fs::write(dir.join(format!("f-{}.txt", file_idx)), b"x").unwrap();
+        }
+    }
+
+    let mut rm = Command::new("rm")
+        .arg("-rf")
+        .arg(&scratch)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rm -rf .scratch");
+
+    for _ in 0..50 {
+        run_command_with_timeout(
+            Command::new("df").arg("-h").arg(&bdir),
+            Duration::from_secs(1),
+            "df -h branchfs mount",
+        );
+        if rm.try_wait().unwrap().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let start = Instant::now();
+    loop {
+        if let Some(status) = rm.try_wait().unwrap() {
+            assert!(status.success(), "rm -rf exited with {}", status);
+            return;
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            let _ = rm.kill();
+            let _ = rm.wait();
+            panic!("rm -rf .scratch did not finish within 30s");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+#[ignore]
+fn test_statfs_responsive_while_first_writing_large_inherited_file() {
+    let fix = TestFixture::new("statfs_cow_write");
+    let mut large = fs::File::create(fix.base.join("large.bin")).unwrap();
+    let chunk = vec![0x5au8; 1024 * 1024];
+    for _ in 0..64 {
+        large.write_all(&chunk).unwrap();
+    }
+    drop(large);
+
+    fix.mount();
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+    let target = bdir.join("large.bin");
+
+    let mut writer = Command::new("dd")
+        .arg("if=/dev/zero")
+        .arg(format!("of={}", target.display()))
+        .arg("bs=4096")
+        .arg("count=1")
+        .arg("conv=notrunc")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn first write to inherited large file");
+
+    for _ in 0..100 {
+        run_command_with_timeout(
+            Command::new("df").arg("-h").arg(&bdir),
+            Duration::from_secs(1),
+            "df -h during first-write COW",
+        );
+        if writer.try_wait().unwrap().is_some() {
+            assert_eq!(fs::metadata(&target).unwrap().len(), 64 * 1024 * 1024);
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let start = Instant::now();
+    loop {
+        if let Some(status) = writer.try_wait().unwrap() {
+            assert!(status.success(), "first-write COW exited with {}", status);
+            assert_eq!(fs::metadata(&target).unwrap().len(), 64 * 1024 * 1024);
+            return;
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = writer.kill();
+            let _ = writer.wait();
+            panic!("first-write COW did not finish within 60s");
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
