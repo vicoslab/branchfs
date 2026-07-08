@@ -184,7 +184,7 @@ impl BranchFs {
             let rx = Arc::new(Mutex::new(rx));
             for idx in 0..BLOCKING_WORKERS {
                 let rx = rx.clone();
-                let _ = std::thread::Builder::new()
+                std::thread::Builder::new()
                     .name(format!("branchfs-blocking-{}", idx))
                     .spawn(move || loop {
                         let job = rx.lock().recv();
@@ -192,7 +192,8 @@ impl BranchFs {
                             Ok(job) => job(),
                             Err(_) => break,
                         }
-                    });
+                    })
+                    .expect("spawn branchfs blocking worker");
             }
             tx
         })
